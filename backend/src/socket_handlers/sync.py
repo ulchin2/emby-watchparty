@@ -1,6 +1,25 @@
 """Sync handlers: play, pause, seek"""
 
+import math
 from datetime import datetime
+
+
+def _coerce_time(raw):
+    """Return a sane non-negative playback second, or None if invalid.
+
+    Socket payloads are attacker-controlled. Previously a string (or NaN)
+    was written straight into party["playback_state"]["time"], after which
+    every other handler that formats or arithmetic's on the clock raised —
+    one member could permanently break the party. Reject non-finite and
+    unparseable values instead of committing them.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
 
 
 def register(ctx):
@@ -77,7 +96,9 @@ def register(ctx):
     @sio.on("play")
     async def handle_play(sid, data):
         party_id = data.get("party_id", "").strip().upper()
-        current_time = data.get("time", 0)
+        current_time = _coerce_time(data.get("time", 0))
+        if current_time is None:
+            return
         party = party_manager.get(party_id)
         if not party:
             return
@@ -86,7 +107,7 @@ def register(ctx):
         if not allowed:
             logger.info(
                 f"handle_play REJECTED: sid={sid} client_id={caller_client_id} "
-                f"is not the selector/host of party {party_id}"
+                f"is not a member of party {party_id}"
             )
             return
 
@@ -118,7 +139,9 @@ def register(ctx):
     @sio.on("pause")
     async def handle_pause(sid, data):
         party_id = data.get("party_id", "").strip().upper()
-        current_time = data.get("time", 0)
+        current_time = _coerce_time(data.get("time", 0))
+        if current_time is None:
+            return
         party = party_manager.get(party_id)
         if not party:
             return
@@ -127,7 +150,7 @@ def register(ctx):
         if not allowed:
             logger.info(
                 f"handle_pause REJECTED: sid={sid} client_id={caller_client_id} "
-                f"is not the selector/host of party {party_id}"
+                f"is not a member of party {party_id}"
             )
             return
 
@@ -152,8 +175,10 @@ def register(ctx):
     @sio.on("seek")
     async def handle_seek(sid, data):
         party_id = data.get("party_id", "").strip().upper()
-        seek_time = data.get("time", 0)
-        was_playing = data.get("was_playing", False)
+        seek_time = _coerce_time(data.get("time", 0))
+        if seek_time is None:
+            return
+        was_playing = bool(data.get("was_playing", False))
         party = party_manager.get(party_id)
         if not party:
             return
@@ -162,7 +187,7 @@ def register(ctx):
         if not allowed:
             logger.info(
                 f"handle_seek REJECTED: sid={sid} client_id={caller_client_id} "
-                f"is not the selector/host of party {party_id}"
+                f"is not a member of party {party_id}"
             )
             return
 

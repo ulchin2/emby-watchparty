@@ -1,5 +1,6 @@
 """Drift correction handler: heartbeat"""
 
+import math
 from datetime import datetime
 
 DRIFT_THRESHOLD = 3.0
@@ -14,7 +15,12 @@ def register(ctx):
     @sio.on("heartbeat")
     async def handle_heartbeat(sid, data):
         party_id = data.get("party_id", "").strip().upper()
-        client_time = data.get("time", 0)
+        try:
+            client_time = float(data.get("time", 0))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(client_time) or client_time < 0:
+            return
         party = party_manager.get(party_id)
 
         if not party or not party.get("current_video"):

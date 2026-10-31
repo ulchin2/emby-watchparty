@@ -12,6 +12,7 @@ Identity model:
 """
 
 import asyncio
+import math
 import time
 from datetime import datetime, timedelta
 from backend.src.quality import (
@@ -19,6 +20,17 @@ from backend.src.quality import (
     normalise_quality_id,
     resolve_quality,
 )
+
+
+def _coerce_clock(raw):
+    """Validate a client-supplied playback second before storing it."""
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
 
 
 def register(ctx):
@@ -505,6 +517,7 @@ def register(ctx):
                     "audio_index": default_audio, "subtitle_index": None,
                     "media_source_id": stream["media_source_id"],
                     "selected_by": selector_client_id, "quality": DEFAULT_QUALITY_ID,
+                    "run_time_seconds": run_time_seconds,
                     "item_type": episode_ctx["item_type"],
                     "series_id": episode_ctx["series_id"],
                     "season_id": episode_ctx["season_id"],
@@ -531,7 +544,7 @@ def register(ctx):
         # _check_all_ready. Run it once here to complete the check and
         # consume auto_play_after_ready cleanly.
         if not live_expected:
-            await _check_all_ready(party_id, party)
+            await _check_all_ready(party, party_id)
 
         return True
 
@@ -758,6 +771,13 @@ def register(ctx):
                 "audio_index": audio_index, "subtitle_index": subtitle_index,
                 "media_source_id": stream["media_source_id"],
                 "selected_by": current_video.get("selected_by"), "quality": quality,
+                "run_time_seconds": current_video.get("run_time_seconds"),
+                "item_type": current_video.get("item_type"),
+                "series_id": current_video.get("series_id"),
+                "season_id": current_video.get("season_id"),
+                "episode_index": current_video.get("episode_index"),
+                "next_item_id": current_video.get("next_item_id"),
+                "next_item_title": current_video.get("next_item_title"),
             },
             "current_time": current_time,
             "was_playing": was_playing,
@@ -1099,7 +1119,9 @@ def register(ctx):
     @sio.on("report_progress")
     async def handle_report_progress(sid, data):
         party_id = data.get("party_id", "").strip().upper()
-        current_time = data.get("time", 0)
+        current_time = _coerce_clock(data.get("time", 0))
+        if current_time is None:
+            return
         party = party_manager.get(party_id)
         if not party or not party.get("current_video"):
             return
