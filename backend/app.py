@@ -103,6 +103,13 @@ async def lifespan(app: FastAPI):
     # restart invalidates all cookies (fine for dev, not for prod), and
     # under gunicorn/uvicorn --workers >1 each worker signs with its
     # own key so session state becomes non-deterministic per request.
+    if _session_placeholder:
+        logger.error(
+            "SESSION_SECRET is set to the public example placeholder. "
+            "It is NOT safe: treating it as empty and using an ephemeral "
+            "key instead. Generate a unique value with "
+            "`openssl rand -hex 32` and set it in .env."
+        )
     if _session_ephemeral:
         logger.warning(
             "SESSION_SECRET env var is empty; using an ephemeral random "
@@ -232,9 +239,25 @@ app = FastAPI(
 import os as _os_session
 SESSION_SECRET = _os_session.getenv("SESSION_SECRET", "").strip()
 _session_ephemeral = False
+_session_placeholder = False
+# The public example used to ship "change-me-openssl-rand-hex-32" as an
+# uncommented value. It is in the git history and every published copy
+# of .env.example, so treating it as a real key lets anyone forge an
+# admin session cookie. Reject the known placeholder and fall back to
+# the ephemeral key (with a loud error) instead of silently trusting it.
+if SESSION_SECRET == "change-me-openssl-rand-hex-32":
+    SESSION_SECRET = ""
+    _session_placeholder = True
 if not SESSION_SECRET:
     SESSION_SECRET = secrets.token_hex(32)
     _session_ephemeral = True
+# SESSION_EXPIRY was documented as the cookie lifetime but never read;
+# max_age was hardcoded to the Starlette 14-day default. Honour the
+# documented setting (default 24h) so operators get what they configure.
+try:
+    SESSION_EXPIRY = max(60, int(_os_session.getenv("SESSION_EXPIRY", "86400") or 86400))
+except ValueError:
+    SESSION_EXPIRY = 86400
 _session_cookie_secure = _os_session.getenv(
     "SESSION_COOKIE_SECURE", "false"
 ).strip().lower() == "true"
@@ -242,7 +265,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
     session_cookie="ewp_session",
-    max_age=14 * 24 * 60 * 60,
+    max_age=SESSION_EXPIRY,
     same_site="lax",
     https_only=_session_cookie_secure,
 )

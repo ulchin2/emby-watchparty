@@ -50,7 +50,8 @@ services:
     #   # restart. Turn SESSION_COOKIE_SECURE=true for HTTPS
     #   # deployments. CORS_ALLOWED_ORIGINS pins the Socket.IO
     #   # origin allowlist (default `*` for backwards compat).
-    #   - SESSION_SECRET=change-me-openssl-rand-hex-32
+    #   # Generate a UNIQUE value; never reuse the public example string.
+    #   - SESSION_SECRET=<output of: openssl rand -hex 32>
     #   - SESSION_COOKIE_SECURE=true
     #   - CORS_ALLOWED_ORIGINS=https://watchparty.example.com
 
