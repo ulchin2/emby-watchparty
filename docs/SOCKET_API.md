@@ -246,8 +246,9 @@ ride HTTP, not the socket.
 
 ### `select_video`
 
-The selector (any party member at this point -- selector identity
-is set on success) picks a video to watch.
+The **host** picks a video to watch. Other members may still change
+their own audio / subtitle / quality through `change_streams`, but they
+cannot start a new party-wide playback.
 
 ```js
 socket.emit('select_video', {
@@ -260,8 +261,10 @@ socket.emit('select_video', {
 })
 ```
 
-**Auth:** Party must be `UNLOCKED`. `PLAYING-ONLY` refuses with
-`error: "Party has no host -- login to become host first"`.
+**Auth:** Party must be `UNLOCKED`, and the caller's `client_id` must
+match `party["host_client_id"]`. `PLAYING-ONLY` refuses with
+`error: "Party has no host -- login to become host first"`. Any other
+member gets `error: "Only the host can choose a video to play."`.
 
 **Side effects:**
 

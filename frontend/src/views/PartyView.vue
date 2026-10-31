@@ -919,6 +919,13 @@ async function continueSelectAfterResume(item: any, startSeconds: number) {
 
 async function selectVideo(item: any) {
   if (!party.partyId) return
+  // The host owns playback selection: the server rejects select_video
+  // from anyone else, and this keeps the shared library panel from
+  // looking clickable for spectators.
+  if (!auth.isHost) {
+    addSystemMessage('Only the host can choose a video to play.')
+    return
+  }
 
   // Resume check first: if Emby reports a current resume position
   // for this item (UserData.PlaybackPositionTicks > 0), ask the host

@@ -596,6 +596,21 @@ def register(ctx):
             await sio.emit("error", {"message": "Not a party member"}, to=sid)
             return
 
+        # Only the host may choose what the room watches. Browsing may be
+        # shared, but starting a transcode is a host action: it spends the
+        # host's Emby token and replaces every viewer's stream. Without
+        # this check any member could emit select_video directly even
+        # though the UI hides the library button from them.
+        if selector_client_id != party.get("host_client_id"):
+            logger.warning(
+                f"select_video REJECTED in {party_id}: client_id="
+                f"{selector_client_id} is not the host"
+            )
+            await sio.emit("error", {
+                "message": "Only the host can choose a video to play."
+            }, to=sid)
+            return
+
         # A manual selection overrides any pending auto-advance. Silent
         # cancel: the upcoming video_selected broadcast is the
         # authoritative signal, so a stale "auto_advance_cancelled"
