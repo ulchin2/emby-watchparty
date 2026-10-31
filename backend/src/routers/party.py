@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from backend.src.dependencies import (
     get_config, get_party_manager, get_logger, get_emby_client, get_sio,
-    get_admin_session_store,
+    get_admin_session_store, _owns_host_identity,
 )
 # Shared dev-host gate -- single source of truth lives in auth.py so the
 # env var name and value-parsing rules can never drift between modules.
@@ -268,13 +268,31 @@ async def join_party(
             success=False, message="client_id and display_name are required"
         )
 
+    # Capture the pre-join binding before overwriting it below. A host
+    # who reloads /party/<id> goes through this route again, and the
+    # grant is what proves host identity to the admin gates and to the
+    # fast host-reclaim path after a refresh. Dropping it unconditionally
+    # meant the host lost that proof on the first page load after
+    # creating/logging in, so a refresh would lock the party after the
+    # grace window even though the host had returned.
+    prior_party_id = (request.session.get("party_id") or "").upper()
+    prior_client_id = request.session.get("client_id")
+    prior_grant = request.session.get("host_session_grant")
+
     request.session["party_id"] = party_id
     request.session["client_id"] = body.client_id
     request.session["display_name"] = body.display_name
-    # Joining is never itself a promotion. Drop any grant carried over
-    # from a party this browser previously hosted, so re-joining can
-    # only ever lose host rights, never silently retain them.
-    request.session.pop("host_session_grant", None)
+    # Joining is never itself a promotion. Keep the grant only when the
+    # caller already proved host identity for this exact party/client;
+    # otherwise drop any grant carried over from a party this browser
+    # previously hosted, so re-joining can only ever lose host rights.
+    same_host_rebind = (
+        prior_party_id == party_id
+        and prior_client_id == body.client_id
+        and _owns_host_identity(party, body.client_id, prior_grant)
+    )
+    if not same_host_rebind:
+        request.session.pop("host_session_grant", None)
     if body.avatar_uuid:
         request.session["avatar_uuid"] = body.avatar_uuid
     else:
