@@ -128,11 +128,12 @@ class RuntimeConfig:
     STATIC_SESSION_ENABLED: bool = False
     STATIC_SESSION_ID: str = 'PARTY'
 
-    # Late-join approval.
-    # When on, a new viewer arriving mid-playback is held in a request
-    # queue until the host admits or declines them. The host keeps a
-    # persistent "Join requests" list in the party UI, so dismissing the
-    # notification never rejects the waiting person.
+    # Join approval.
+    # When on, a new viewer joining a party that already has members is
+    # held in a request queue until the host admits or declines them --
+    # in the lobby or mid-playback. The host keeps a persistent "Join
+    # requests" list in the party UI, so dismissing the notification
+    # never rejects the waiting person.
     LATE_JOIN_APPROVAL_ENABLED: bool = True
     # How long a request stays in the host's list before it expires. The
     # waiting screen shows this as a countdown. 0 = never expires.

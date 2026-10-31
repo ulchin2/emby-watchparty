@@ -52,7 +52,8 @@ def list_parties(
     parties and what they are watching is not exposed. Lists every party
     that has at least one member (the static-session party is excluded
     since the index auto-redirects into it). Clicking a listed party
-    joins it, which triggers the late-joiner vote when a video is playing.
+    joins it, which queues a host approval request when the party
+    already has members.
 
     Logging note: this route is polled every ~5s per open index tab, so it
     deliberately stays at DEBUG (no INFO spam). A malformed party is logged

@@ -160,19 +160,20 @@ socket.emit('join_party', {
   `current_video.selected_by` if matching, Emby session cleanup
   for the stale stream). **Skips the join-approval queue** even if
   a video is playing.
-- If `client_id` is unknown AND a video is playing AND approval is
-  enabled (`LATE_JOIN_APPROVAL_ENABLED`) AND the party has an active
-  host, the socket is put in the party room but **not** in
+- If `client_id` is unknown AND the party already has members AND
+  approval is enabled (`LATE_JOIN_APPROVAL_ENABLED`) AND the party has
+  an active host, the socket is put in the party room but **not** in
   `party["users"]`. A request is added to `party["join_requests"]`,
   the joiner gets `join_request_pending`, and the room gets
-  `join_requests_update`. Re-joining from the same `client_id`
-  refreshes the existing entry instead of duplicating it.
+  `join_requests_update`. This applies in the lobby and during
+  playback; a video does not have to be active. Re-joining from the
+  same `client_id` refreshes the existing entry instead of duplicating
+  it.
 - If the party has no active host (host left / grace window), the
   gate is skipped and the joiner is admitted through the normal
-  late-join path so they are not stranded in a queue nobody can
-  clear.
-- If `MAX_USERS_PER_PARTY` is exceeded, emits `error` to the joiner
-  and does not add them. The queue counts toward the cap.
+  join path so they are not stranded in a queue nobody can clear.
+- If `MAX_USERS_PER_PARTY` is exceeded, emits `join_rejected` to the
+  joiner and does not add them. The queue counts toward the cap.
 - On a clean join (no approval, no rejection), emits `user_joined`
   to the room and `sync_state` privately to the new joiner with
   the current playback state, including the current
@@ -609,12 +610,12 @@ client (any)                    server                          all clients
   |                              | --- all_ready ----------------->| (everyone resumes)
 ```
 
-### Late join with host approval (video already playing)
+### Join with host approval
 
 ```
 joiner          server (host + room)                host
   | --- join_party ------------->|
-  |                              | new client_id, video active, host present
+  |                              | new client_id, host present, room has members
   |                              | queue request (joiner NOT in users)
   | <-- join_request_pending ----|
   |                              | --- join_requests_update ------>| (host list + toast)
@@ -624,7 +625,7 @@ joiner          server (host + room)                host
   |                              | --- join_request_resolved --->  | (approved)
   |                              | add joiner to users
   | <-- user_joined (room) ------|-------------------------------->|
-  | <-- sync_state (to=sid) -----| (stream at current position; no room restart)
+  | <-- sync_state (to=sid) -----| (current state; stream at current position if playing)
 ```
 
 Dismissing the toast, clicking outside it, or closing the list is a
@@ -686,9 +687,10 @@ host                            server                          remaining member
   requests. Dismissing a notification never resolves a request;
   only `join_request_decision`, a joiner disconnect, or the request
   timeout removes an entry.
-- **Admission does not restart the movie.** An approved joiner gets
-  a per-user stream starting at the current party position, exactly
-  like a normal late join. Existing viewers keep playing.
+- **Admission does not restart the movie.** If a video is active, an
+  approved joiner gets a per-user stream starting at the current
+  party position, exactly like a normal late join. In the lobby they
+  simply join the participant list. Existing viewers keep playing.
 - **Host grace is 5 seconds.** A refresh / brief network blip
   preserves host status; a real disconnect collapses to
   PLAYING-ONLY or LOCKED depending on whether a video is in

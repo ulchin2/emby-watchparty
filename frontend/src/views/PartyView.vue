@@ -125,7 +125,7 @@ const showVersionModal = ref(false)
 const showParticipants = ref(false)
 const showMobileChat = ref(false)
 const showAdminModal = ref(false)
-// Host-only persistent queue of people asking to join mid-playback.
+// Host-only persistent queue of people asking to join the party.
 // The header chip opens it; the toast links to it, but dismissing the
 // toast leaves this list intact.
 const showJoinRequests = ref(false)

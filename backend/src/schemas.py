@@ -350,7 +350,7 @@ class PartyListItem(BaseModel):
     code: str
     title: Optional[str] = None   # what is being watched; None when no video
     user_count: int
-    playing: bool                 # True when a video is active (join -> vote)
+    playing: bool                 # True when a video is active
     locked: bool                  # True when the party has no host (library locked)
 
 

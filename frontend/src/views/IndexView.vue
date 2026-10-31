@@ -47,8 +47,8 @@ async function loadParties() {
 }
 
 function joinListedParty(code: string) {
-  // Reuses the normal join flow: a party that is mid-playback queues a
-  // host approval request; an idle one joins straight away.
+  // Reuses the normal join flow: a party that already has members
+  // queues a host approval request; an empty one joins straight away.
   router.push(`/party/${code}`)
 }
 
@@ -194,7 +194,7 @@ function joinParty() {
           </div>
         </li>
       </ul>
-      <p class="ap-hint">Joining a party that is mid-playback sends a request the host can admit from their Join requests list.</p>
+      <p class="ap-hint">Joining an active party sends a request the host can admit from their Join requests list.</p>
     </section>
 
     <div v-if="status" class="status-msg">{{ status }}</div>

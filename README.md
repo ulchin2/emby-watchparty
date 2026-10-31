@@ -84,7 +84,7 @@ Thanks to **@stealthydruid** and **@xyxxyxxy** for the bug reports and feature r
 - **Secure proxy architecture**: your Emby server stays on the local network; only the WatchParty app is exposed
 - **FastAPI + Vue 3 + TypeScript stack**: async end-to-end, typed OpenAPI docs at `/docs` and `/redoc`, single uvicorn process serves backend + compiled SPA
 - **Real-time sync with drift correction**: selector-authoritative play/pause/seek against a party clock, keeping independent streams aligned
-- **Host-approved late joins**: mid-playback joiners land in a persistent Join requests list; the host admits or declines, and dismissing the notification never rejects or starts a cooldown. Admitted viewers start at the current position, so nobody is yanked back to 0:00
+- **Host-approved joins**: anyone entering a party that already has members lands in a persistent Join requests list; the host admits or declines, and dismissing the notification never rejects or starts a cooldown. Admitted viewers get the current state, or the current playback position if a video is already running, so nobody is yanked back to 0:00
 - **Host-provider auth model**: UNLOCKED / PLAYING-ONLY / LOCKED lock states around the Emby-authenticated host, with a grace window for quick refreshes
 - **Per-user transcodes**: every viewer gets their own Emby `PlaySessionId`, so audio, subtitles, quality, and version are personal without disrupting the room
 - **Multi-version playback**: host-locked picker for items with multiple MediaSources (theatrical vs director's cut, mp4 vs mkv, 1080p vs 4K HDR)
@@ -184,7 +184,7 @@ before rejoining.
    cp .env.example .env
    ```
 
-   Only boot-essential settings live in `.env` - see [`.env.example`](.env.example) for the full annotated list (bind/port, `APP_PREFIX`, `SESSION_SECRET`, `SESSION_COOKIE_SECURE`, `CORS_ALLOWED_ORIGINS`, `EMBY_SERVER_URL`, `EMBY_API_KEY`). All other runtime options (logging, rate limits, late-join approval, `FORCE_TRANSCODE`, `REQUIRE_LOGIN`, etc.) are managed live from the Admin Panel at `/admin` and persisted to `config.json`.
+   Only boot-essential settings live in `.env` - see [`.env.example`](.env.example) for the full annotated list (bind/port, `APP_PREFIX`, `SESSION_SECRET`, `SESSION_COOKIE_SECURE`, `CORS_ALLOWED_ORIGINS`, `EMBY_SERVER_URL`, `EMBY_API_KEY`). All other runtime options (logging, rate limits, join approval, `FORCE_TRANSCODE`, `REQUIRE_LOGIN`, etc.) are managed live from the Admin Panel at `/admin` and persisted to `config.json`.
 
 4. **Run the application** from the repository root:
 
@@ -279,7 +279,7 @@ In both modes, when the host disconnects mid-playback the in-flight video keeps 
 3. Enter your username
 4. Start watching together!
 
-If you join **before** a video has been selected, you land directly in the party. If you join **while a video is already playing**, your request appears in the host's **Join requests** list. The host gets a non-blocking notification with **Admit** / **Later**; dismissing it, clicking outside it, or closing the list does **not** reject you. You enter automatically when admitted, at the current playback position, without restarting the movie for everyone.
+If you join an **empty** party, you land directly in it. If the party **already has members**, your request appears in the host's **Join requests** list, whether a video is playing or not. The host gets a non-blocking notification with **Admit** / **Later**; dismissing it, clicking outside it, or closing the list does **not** reject you. You enter automatically when admitted, at the current playback position if a video is running, without restarting the movie for everyone.
 
 ### In-party controls
 
@@ -352,11 +352,11 @@ Runtime, hot-reloadable. All of the following settings are editable at `/admin`.
 | Static session mode | Auto-create a fixed party on startup | `false` |
 | Static session ID | Party code when static mode is enabled | `PARTY` |
 
-**Late join approval**
+**Join approval**
 
 | Setting | Description | Default |
 |---|---|---|
-| Host approval for late joins | Queue users who join mid-playback until the host admits or declines them | `true` |
+| Host approval for new joins | Queue new users until the host admits or declines them | `true` |
 | Request timeout (s) | How long a request stays in the host's Join requests list (0 = never expires) | `300` |
 | Decline cooldown (s) | Applied only after the host explicitly declines; dismissing the notification or closing the list never applies it (0 disables) | `0` |
 | Max pending join requests | Cap on the host's waiting list (0 = unlimited) | `10` |
@@ -429,7 +429,7 @@ See `/docs` for the full parameter, response, and auth-scope details.
 Mounted under `${APP_PREFIX}/socket.io`. Events group into these categories:
 
 - **Connection lifecycle** - `connect` / `disconnect` / `connected`, transparent reconnect via stable `client_id`.
-- **Party join / leave / approval** - `join_party`, `leave_party`, `user_joined` / `user_left`, plus the host-approved late-join queue (`join_request_decision`, `join_requests_update`, `join_request_pending`, `join_request_resolved`, `join_rejected`).
+- **Party join / leave / approval** - `join_party`, `leave_party`, `user_joined` / `user_left`, plus the host-approved join queue (`join_request_decision`, `join_requests_update`, `join_request_pending`, `join_request_resolved`, `join_rejected`).
 - **Host state** - `host_changed`, `host_left`, `host_reclaimed`, three-state lock (UNLOCKED / PLAYING-ONLY / LOCKED).
 - **Playback** - `select_video`, `stop_video`, `change_streams` (per-user), `play`, `pause`, `seek`, `video_selected`, `streams_changed`, `video_stopped`, `video_ended`.
 - **Sync coordination** - `stream_ready`, `ready_check_update`, `all_ready`, `force_pause_before_seek`, `heartbeat` + `drift_correction`, `report_progress`.

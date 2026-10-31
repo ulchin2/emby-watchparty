@@ -302,7 +302,7 @@ def register(ctx):
             pass
 
     async def _enqueue_join_request(party, party_id, sid, username, client_id, avatar_uuid):
-        """Hold a mid-playback joiner in the queue.
+        """Hold a new joiner in the queue.
 
         Re-requesting from the same browser (reload / retry) updates the
         existing entry in place instead of stacking duplicates. Returns
@@ -512,10 +512,10 @@ def register(ctx):
         }, room=party_id)
         await _broadcast_join_requests(party, party_id)
 
-        # Admission is the normal late-join path: the new viewer gets a
-        # per-user stream starting at the current party position. No
-        # video restart, so approving someone mid-movie does not yank
-        # everyone else back to 0:00.
+        # Admission is the normal join path: the viewer is added to the
+        # room and receives sync_state. If a video is active they get a
+        # per-user stream starting at the current party position, with
+        # no room-wide restart.
         await _finalize_member_join(
             party, party_id, sid, username, client_id,
             request.get("avatar_uuid"), rejoin=False,
@@ -719,14 +719,17 @@ def register(ctx):
                 break
 
         # -----------------------------------------------------------------
-        # Mid-playback approval gate
+        # Join approval gate
+        #
+        # Approval applies to every new person entering a party that
+        # already has members -- including the lobby, before any video is
+        # selected. It is not tied to playback state.
         # -----------------------------------------------------------------
         approval_enabled = bool(getattr(config, "LATE_JOIN_APPROVAL_ENABLED", True))
-        has_active_video = party.get("current_video") is not None
         has_existing_users = len(party["users"]) > 0
         # An absent host (grace window running, or stepped down) must not
         # strand a joiner in a queue nobody can clear. In that state the
-        # party falls back to the normal late-join path.
+        # party falls back to the normal join path.
         has_active_host = (
             bool(party.get("host_client_id"))
             and party.get("host_left_at") is None
@@ -734,15 +737,14 @@ def register(ctx):
         needs_approval = (
             not rejoin
             and approval_enabled
-            and has_active_video
             and has_existing_users
             and has_active_host
         )
 
         if pending_request and not needs_approval:
-            # The reason for holding them disappeared (video stopped, host
-            # left). Admit instead of making them wait for a decision that
-            # no longer has anything to protect.
+            # The reason for holding them disappeared (host left, or the
+            # room emptied). Admit instead of making them wait for a
+            # decision that no longer has anything to protect.
             if pending_request.get("sid") and pending_request["sid"] != sid:
                 try:
                     await sio.leave_room(pending_request["sid"], party_id)

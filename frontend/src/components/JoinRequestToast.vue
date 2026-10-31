@@ -178,7 +178,7 @@ onUnmounted(() => {
           <strong>{{ current.username }}</strong> wants to join
         </div>
         <div class="toast-sub">
-          They'll start at the current position.
+          They'll join the party.
           <span v-if="otherCount > 0" class="toast-more">
             +{{ otherCount }} more waiting
           </span>

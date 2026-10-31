@@ -66,8 +66,8 @@ async function cancelRequest() {
       <h2>Waiting for the host</h2>
       <p class="explain">
         Your request is in the host's <strong>Join requests</strong> list.
-        The movie keeps playing for everyone else, and you'll be let in
-        automatically as soon as the host admits you.
+        The party keeps going, and you'll be let in automatically as soon
+        as the host admits you.
       </p>
 
       <div v-if="timerLabel" class="timer">

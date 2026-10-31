@@ -468,7 +468,7 @@ loadConfig()
         <div class="setting-row">
           <div class="setting-label">
             <span>Host Approval for Late Joins</span>
-            <span class="setting-hint">Queue users who join mid-playback until the host admits or declines them</span>
+            <span class="setting-hint">Queue new users until the host admits or declines them</span>
           </div>
           <ToggleSwitch v-model="config.LATE_JOIN_APPROVAL_ENABLED" />
         </div>

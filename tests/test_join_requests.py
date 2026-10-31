@@ -165,6 +165,34 @@ class JoinRequestQueueTests(unittest.IsolatedAsyncioTestCase):
             self.sio.events("join_requests_update")[-1]["room"], "ABC12"
         )
 
+    async def test_lobby_joiner_is_queued_before_any_video_is_selected(self):
+        # Approval is not playback-specific: a party that already has a
+        # host and members still gates new people in the lobby.
+        self.party["current_video"] = None
+        self.party["playback_state"] = {
+            "playing": False, "time": 0,
+            "last_update": datetime.now().isoformat(),
+        }
+
+        await self.async_join("bob-sid", "Bob", "bob-client")
+
+        self.assertNotIn("Bob", self.party["users"].values())
+        self.assertEqual(len(self.party["join_requests"]), 1)
+        self.assertEqual(
+            self.sio.events("join_request_pending")[-1]["to"], "bob-sid"
+        )
+
+        request_id = next(iter(self.party["join_requests"]))
+        await self.decide("host-sid", {
+            "party_id": "ABC12",
+            "request_id": request_id,
+            "action": "approve",
+        })
+
+        self.assertIn("Bob", self.party["users"].values())
+        sync = self.sio.events("sync_state")[-1]
+        self.assertIsNone(sync["data"]["current_video"])
+
     async def test_reload_refreshes_the_same_request(self):
         await self.async_join("bob-sid", "Bob", "bob-client")
         request_id = next(iter(self.party["join_requests"]))

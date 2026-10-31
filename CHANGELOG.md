@@ -18,9 +18,9 @@ Thanks to **[Christian Gillinger](https://github.com/cgillinger)** for the "Refi
 
 ## [Unreleased]
 
-**Late joins are approved by the host from a persistent request list instead of a room-wide vote.**
+**New joiners are approved by the host from a persistent request list instead of a room-wide vote.**
 
-When someone joins while a video is already playing, their request now appears in the host's **Join requests** list. The host gets a non-blocking notification with **Admit** and **Later**; dismissing it, clicking outside it, or closing the list does **not** reject the person and does **not** start a cooldown. The request stays in the list until the host admits or declines it (or the configured timeout expires). Admitting a viewer starts their stream at the current playback position, so nobody is pulled back to the beginning.
+Whenever someone joins a party that already has members, their request appears in the host's **Join requests** list -- in the lobby or while a video is playing. The host gets a non-blocking notification with **Admit** and **Later**; dismissing it, clicking outside it, or closing the list does **not** reject the person and does **not** start a cooldown. The request stays in the list until the host admits or declines it (or the configured timeout expires). Admitting a viewer hands them the current room state; if a video is playing they start at its current position, so nobody is pulled back to the beginning.
 
 ### Changed
 

@@ -139,7 +139,7 @@ export const usePartyStore = defineStore('party', () => {
     countdownSeconds: number | null
   } | null>(null)
 
-  // Host-side queue of people asking to join mid-playback. The server
+  // Host-side queue of people asking to join the party. The server
   // broadcasts the whole queue on every change (and in sync_state), so
   // a host who reloads still sees pending requests.
   const joinRequests = ref<JoinRequestInfo[]>([])
