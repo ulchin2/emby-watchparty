@@ -180,12 +180,26 @@ export const usePartyStore = defineStore('party', () => {
 
   const userCount = computed(() => users.value.length)
 
+  /**
+   * Generate a display name client-side when the join form is left
+   * blank. The server also generates one, but then this client never
+   * learns which name it got: its own chat messages render as a
+   * stranger and, in the late-join flow, the approval event does not
+   * match the local empty name so the waiting overlay can stay up after
+   * admission. Choosing locally keeps both sides identical.
+   */
+  function generateGuestName(): string {
+    const suffix = Math.random().toString(36).slice(2, 6).toUpperCase()
+    return `Guest-${suffix || Date.now().toString(36).slice(-4).toUpperCase()}`
+  }
+
   async function join(id: string, name: string) {
     const socket = useSocketStore()
     const avatar = useAvatarStore()
     const normalisedId = id.toUpperCase()
+    const resolvedName = (name || '').trim() || generateGuestName()
     partyId.value = normalisedId
-    username.value = name
+    username.value = resolvedName
     // Never carry a previous party's request queue into this one; a
     // rejoin/host reload rehydrates it from sync_state.
     joinRequests.value = []
@@ -201,12 +215,12 @@ export const usePartyStore = defineStore('party', () => {
     // Announce only once the cookie is actually bound. A tab that failed
     // to bind never repointed anything, so it must not make a healthy
     // tab believe it has been superseded.
-    if (await bindSession(clientId, name, avatarUuid)) {
+    if (await bindSession(clientId, resolvedName, avatarUuid)) {
       announceBinding(normalisedId)
     }
     socket.emit('join_party', {
       party_id: partyId.value,
-      username: name,
+      username: resolvedName,
       client_id: clientId,
       avatar_uuid: avatarUuid,
       video_codecs: detectVideoCodecs(),
@@ -231,7 +245,13 @@ export const usePartyStore = defineStore('party', () => {
     const auth = useAuthStore()
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        await api.joinParty(partyId.value!, clientId, name || 'Guest', avatarUuid)
+        const res = await api.joinParty(partyId.value!, clientId, name || 'Guest', avatarUuid)
+        // The endpoint returns HTTP 200 with success:false for refusals
+        // (party gone, bad fields), so a resolved promise is not proof
+        // that the cookie was minted.
+        if (res && res.success === false) {
+          throw new Error(res.message || 'Could not join this party.')
+        }
         // The cookie is now bound. Re-read auth state so partyUnlocked
         // and hostUsername reflect this party, not the empty pre-join
         // status. Otherwise late joiners briefly render "Party is
@@ -303,6 +323,9 @@ export const usePartyStore = defineStore('party', () => {
     waitingUsers.value = []
     joinRequests.value = []
     pendingJoinRequest.value = null
+    // Without this, a countdown hydrated in party A stays overlaid on
+    // party B after leaving mid-advance and joining elsewhere.
+    pendingAutoAdvance.value = null
   }
 
   /** Approve or decline a queued request. Host-only on the server. */
@@ -314,6 +337,16 @@ export const usePartyStore = defineStore('party', () => {
       action,
     })
   }
+
+  // Reconnect handler and its one-shot initial-connect guard live at
+  // store scope, not inside setupListeners(). On a PartyView remount the
+  // socket is already connected, so a fresh local flag would swallow the
+  // NEXT genuine reconnect and never re-emit join_party. Keeping the
+  // handler reference also lets us remove only this listener instead of
+  // socket.off('connect'), which used to strip the socket store's own
+  // connected/hasEverConnected handler.
+  let reconnectHandler: (() => void) | null = null
+  let initialConnectSeen = false
 
   function setupListeners() {
     const socket = useSocketStore()
@@ -329,14 +362,18 @@ export const usePartyStore = defineStore('party', () => {
       'video_stopped', 'video_ended', 'play', 'pause', 'seek',
       'streams_changed', 'ready_check_update', 'all_ready',
       'join_requests_update', 'join_request_pending', 'join_request_resolved',
-      'join_rejected',
+      'join_rejected', 'members_update',
       'binge_watch_state_changed', 'auto_advance_pending',
       'auto_advance_cancelled', 'auto_advance_fired', 'binge_finished',
     ]
     for (const e of events) socket.off(e)
-    // Also drop the reconnect listener before re-registering, same
-    // reasoning as the event list above.
-    socket.off('connect')
+    // Remove only OUR reconnect listener. socket.off('connect') would
+    // also remove the socket store's connected/hasEverConnected handler,
+    // leaving the reconnect banner permanently hidden.
+    if (reconnectHandler) {
+      socket.off('connect', reconnectHandler)
+      reconnectHandler = null
+    }
 
     // Auto re-join on socket reconnect. The server evicts us from
     // party["users"] and the Socket.IO room on disconnect (see
@@ -349,14 +386,14 @@ export const usePartyStore = defineStore('party', () => {
     // _replace_sid migrates state to the new sid, no join-approval
     // request fires, and the server sends a fresh sync_state.
     //
-    // We use a store-local flag (initialConnectSeen) instead of just
+    // We use a store-level flag (initialConnectSeen) instead of just
     // "is partyId set?" because join() runs asynchronously after
     // setupListeners() -- if join() sets partyId + emits before the
     // very first `connect` fires, socket.io buffers the emit and then
     // this listener would fire ALSO and produce a duplicate join_party.
-    // Skipping exactly one connect avoids that race.
-    let initialConnectSeen = false
-    socket.on('connect', () => {
+    // Skipping exactly one connect avoids that race. Store scope keeps
+    // the guard correct across PartyView remounts.
+    reconnectHandler = () => {
       if (!initialConnectSeen) {
         initialConnectSeen = true
         return
@@ -371,7 +408,8 @@ export const usePartyStore = defineStore('party', () => {
         avatar_uuid: avatarUuid,
         video_codecs: detectVideoCodecs(),
       })
-    })
+    }
+    socket.on('connect', reconnectHandler)
 
     socket.on('user_joined', (data: any) => {
       users.value = data.users
@@ -382,6 +420,7 @@ export const usePartyStore = defineStore('party', () => {
         (data?.username && data.username === username.value)
         || (pending && data?.username === pending.username)
       ) {
+        if (!username.value && data?.username) username.value = data.username
         pendingJoinRequest.value = null
       }
       if (Array.isArray(data.members)) {
@@ -450,6 +489,11 @@ export const usePartyStore = defineStore('party', () => {
           timeoutAt: new Date(pa.deadline).getTime(),
           countdownSeconds: pa.countdown_seconds ?? null,
         }
+      } else {
+        // A sync_state with no countdown means none is running. The old
+        // code left a hydrated overlay in place, so it survived a
+        // reconnect into a different state.
+        pendingAutoAdvance.value = null
       }
       // Hydrate the join-request queue. Only the host renders the
       // list, but broadcasting it to the whole room keeps a newly
@@ -549,7 +593,11 @@ export const usePartyStore = defineStore('party', () => {
       // Per-user: only this user receives their updated stream.
       // Backend restarts the transcode with StartTimeTicks=current_time,
       // so the new stream's time 0 maps to current_time media position.
-      currentVideo.value = data.video
+      // Merge rather than replace: the streams_changed payload carries
+      // only stream fields, so a wholesale assignment erased runtime,
+      // item_type and the binge "next episode" metadata after every
+      // audio/subtitle/quality change.
+      currentVideo.value = { ...(currentVideo.value || {}), ...(data.video || {}) }
       if (data.video?.stream_url) {
         myStreamUrl.value = data.video.stream_url
       }

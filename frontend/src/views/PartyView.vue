@@ -109,6 +109,10 @@ function chatAvatarSrc(msg: { username: string; avatar_uuid?: string | null }): 
 const STORAGE_KEY = 'emby-watchparty-username'
 const usernameInput = ref('')
 const joined = ref(false)
+// Visible on the join card. Server-side join errors used to go only to
+// the chat, which is hidden behind this screen, so a full/duplicate/
+// not-found rejection just looked like the form silently resetting.
+const joinError = ref<string | null>(null)
 // We only need the username modal when we have nothing to auto-join with.
 // Without this flag, the modal flashes on every mount before the socket
 // confirms the auto-join, even when localStorage has a saved name.
@@ -139,6 +143,11 @@ let pendingPauseTimer: ReturnType<typeof setTimeout> | null = null
 const myStreamReloading = ref(false)
 
 const versionInfo = ref({ version: '', codename: '' })
+
+// keep a reference so remounts replace only PartyView's alert handler
+// instead of `socket.off('join_rejected')`, which would also strip the
+// party store's handler that clears the waiting/rejected state.
+let joinRejectedHandler: ((data: any) => void) | null = null
 
 function onAdminEscKey(e: KeyboardEvent) {
   if (e.key === 'Escape' && showAdminModal.value) {
@@ -206,7 +215,7 @@ onMounted(async () => {
   const partyViewEvents = [
     'chat_message', 'play', 'pause', 'seek', 'force_pause_before_seek',
     'ready_check_update', 'drift_correction', 'all_ready',
-    'error', 'toggle_library',
+    'error', 'toggle_library', 'party_dissolved',
   ]
   for (const e of partyViewEvents) socket.off(e)
 
@@ -400,11 +409,16 @@ onMounted(async () => {
   // starts (detected by readyCheckActive going from false to true).
   let autoReadySignaled = false
 
+  // flush: 'sync' matters. With the default 'pre' flush this watcher
+  // runs a microtask AFTER the ready_check_update handler below, so the
+  // flag was reset immediately after the first stream_ready of every
+  // check. Each later broadcast then re-emitted stream_ready, creating a
+  // self-sustaining emit/broadcast loop while anyone was still loading.
   watch(() => party.readyCheckActive, (active) => {
     if (active) {
       autoReadySignaled = false
     }
-  })
+  }, { flush: 'sync' })
 
   socket.on('ready_check_update', () => {
     if (autoReadySignaled) return
@@ -556,8 +570,10 @@ onMounted(async () => {
       return
     }
     // An error during auto-join means we should fall back to the manual
-    // name prompt; otherwise the spinner sits forever.
+    // name prompt; otherwise the spinner sits forever. Surface it on the
+    // join card too: chat is not visible before `joined` flips true.
     awaitingAutoJoin.value = false
+    joinError.value = msg
     addSystemMessage(`Error: ${msg}`)
   })
 
@@ -580,12 +596,16 @@ onMounted(async () => {
     }
   })
 
-  // Late-joiner rejection: redirect home with a message
-  socket.on('join_rejected', (data: any) => {
+  // Late-joiner rejection: redirect home with a message. The party
+  // store also listens to this event to clear pending state; remove
+  // only our previous alert handler, never every listener on the event.
+  if (joinRejectedHandler) socket.off('join_rejected', joinRejectedHandler)
+  joinRejectedHandler = (data: any) => {
     const msg = data?.message || 'The party declined your request to join.'
     alert(msg)
     router.push('/')
-  })
+  }
+  socket.on('join_rejected', joinRejectedHandler)
 
   // Party was dissolved server-side (e.g. an admin disabled static
   // sessions while we were inside one). Clean up and redirect home.
@@ -638,6 +658,10 @@ onUnmounted(() => {
     pendingPauseTimer = null
   }
   document.removeEventListener('keydown', onAdminEscKey)
+  if (joinRejectedHandler) {
+    socket.off('join_rejected', joinRejectedHandler)
+    joinRejectedHandler = null
+  }
   // Do NOT call party.leave() here. PartyView unmounts on every
   // navigation (e.g. clicking the Admin or Version links), and a full
   // leave would emit leave_party to the backend AND clear the session
@@ -780,6 +804,7 @@ function formatTime(seconds: number): string {
 
 function joinWithName(name: string) {
   const id = route.params.id as string
+  joinError.value = null
   if (!name) name = ''
   party.join(id, name)
   if (name) localStorage.setItem(STORAGE_KEY, name)
@@ -791,6 +816,7 @@ watch(() => party.users, (users) => {
   if (users.length > 0 && !joined.value) {
     joined.value = true
     awaitingAutoJoin.value = false
+    joinError.value = null
   }
 }, { deep: true })
 
@@ -1408,7 +1434,8 @@ async function submitBecomeHost(payload: { username: string; password: string })
   <div v-else-if="!joined" class="modal-overlay">
     <div class="modal-card">
       <h2>Join Watch Party</h2>
-      <p>Enter your name (or leave blank for random name):</p>
+      <p>Enter your name (or leave blank for a random name):</p>
+      <p v-if="joinError" class="join-error" role="alert">{{ joinError }}</p>
       <input v-model="usernameInput" @keypress.enter="submitJoin" placeholder="Your name (optional)" type="text" autofocus />
       <button @click="submitJoin" class="btn btn-primary">Join</button>
     </div>
@@ -1870,6 +1897,17 @@ async function submitBecomeHost(payload: { username: string; password: string })
 .modal-card p {
   margin-bottom: var(--space-md);
   font-size: 0.9rem;
+}
+
+.join-error {
+  margin: 0 0 var(--space-md);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(244, 63, 94, 0.12);
+  border: 1px solid rgba(244, 63, 94, 0.3);
+  color: #fb7185;
+  font-size: 0.82rem;
+  line-height: 1.4;
 }
 
 .modal-card input {

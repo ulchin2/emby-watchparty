@@ -28,6 +28,9 @@ interface ActiveParty {
 }
 const parties = ref<ActiveParty[]>([])
 let pollTimer: ReturnType<typeof setInterval> | null = null
+// onMounted awaits two requests before starting the poller. Navigating
+// away during that window left the 5s interval running forever.
+let unmounted = false
 
 async function loadParties() {
   if (auth.requireLogin) {
@@ -80,12 +83,15 @@ onMounted(async () => {
   } catch {
     // No static session or error, show normal index
   }
+  if (unmounted) return
   loadParties()
   pollTimer = setInterval(loadParties, 5000)
 })
 
 onUnmounted(() => {
+  unmounted = true
   if (pollTimer) clearInterval(pollTimer)
+  pollTimer = null
 })
 
 async function createParty() {
