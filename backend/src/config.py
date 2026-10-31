@@ -114,6 +114,10 @@ class RuntimeConfig:
 
     # Security
     MAX_USERS_PER_PARTY: int = 0
+    # Cap on simultaneous pending join requests. Stops a scripted join
+    # flood from turning the host's request list into an unusable wall.
+    # 0 disables the cap (not recommended for public deployments).
+    MAX_PENDING_JOIN_REQUESTS: int = 10
     ENABLE_HLS_TOKEN_VALIDATION: bool = True
     HLS_TOKEN_EXPIRY: int = 86400
     ENABLE_RATE_LIMITING: bool = True
@@ -124,13 +128,19 @@ class RuntimeConfig:
     STATIC_SESSION_ENABLED: bool = False
     STATIC_SESSION_ID: str = 'PARTY'
 
-    # Late joiner vote
-    LATE_JOIN_VOTE_ENABLED: bool = True
-    LATE_JOIN_VOTE_TIMEOUT_SECONDS: int = 20
-    # Cooldown after a failed/cancelled vote before a new late join is
-    # allowed. Prevents a malicious user from spamming the party URL to
-    # repeatedly pop vote modals on existing watchers.
-    LATE_JOIN_VOTE_COOLDOWN_SECONDS: int = 30
+    # Late-join approval.
+    # When on, a new viewer arriving mid-playback is held in a request
+    # queue until the host admits or declines them. The host keeps a
+    # persistent "Join requests" list in the party UI, so dismissing the
+    # notification never rejects the waiting person.
+    LATE_JOIN_APPROVAL_ENABLED: bool = True
+    # How long a request stays in the host's list before it expires. The
+    # waiting screen shows this as a countdown. 0 = never expires.
+    LATE_JOIN_REQUEST_TIMEOUT_SECONDS: int = 300
+    # Cooldown applied to a client only after the host explicitly
+    # declines it. Dismissing the notification or closing the list does
+    # NOT apply a cooldown. 0 disables the cooldown entirely.
+    LATE_JOIN_DENY_COOLDOWN_SECONDS: int = 0
 
     @classmethod
     def from_file(cls, path: Path = CONFIG_JSON_PATH) -> 'RuntimeConfig':
@@ -152,6 +162,16 @@ class RuntimeConfig:
             try:
                 with open(path, 'r') as f:
                     data = json.load(f)
+                # 2.2 renamed the vote gate to an approval queue. Carry
+                # an existing on/off preference across so operators who
+                # had disabled late-join gating do not silently get it
+                # back after upgrading.
+                if (
+                    isinstance(data, dict)
+                    and "LATE_JOIN_APPROVAL_ENABLED" not in data
+                    and "LATE_JOIN_VOTE_ENABLED" in data
+                ):
+                    data["LATE_JOIN_APPROVAL_ENABLED"] = data["LATE_JOIN_VOTE_ENABLED"]
                 instance.update_from_dict(data)
             except json.JSONDecodeError as e:
                 backup = path.with_name(f"{path.name}.corrupt-{int(_t.time())}")
@@ -355,11 +375,12 @@ class RuntimeConfig:
             'Playback': ['FORCE_TRANSCODE', 'BINGE_WATCH_ENABLED', 'BINGE_WATCH_COUNTDOWN_SECONDS'],
             'Quality': ['ENABLED_QUALITY_OPTIONS'],
             'Logging': ['LOG_LEVEL', 'LOG_TO_FILE', 'LOG_FILE', 'LOG_FORMAT', 'LOG_MAX_SIZE', 'CONSOLE_LOG_LEVEL'],
-            'Security': ['MAX_USERS_PER_PARTY', 'ENABLE_HLS_TOKEN_VALIDATION', 'HLS_TOKEN_EXPIRY',
+            'Security': ['MAX_USERS_PER_PARTY', 'MAX_PENDING_JOIN_REQUESTS',
+                         'ENABLE_HLS_TOKEN_VALIDATION', 'HLS_TOKEN_EXPIRY',
                          'ENABLE_RATE_LIMITING', 'RATE_LIMIT_PARTY_CREATION', 'RATE_LIMIT_API_CALLS'],
             'Session': ['STATIC_SESSION_ENABLED', 'STATIC_SESSION_ID'],
-            'Late Join Vote': ['LATE_JOIN_VOTE_ENABLED', 'LATE_JOIN_VOTE_TIMEOUT_SECONDS',
-                                'LATE_JOIN_VOTE_COOLDOWN_SECONDS'],
+            'Late Join': ['LATE_JOIN_APPROVAL_ENABLED', 'LATE_JOIN_REQUEST_TIMEOUT_SECONDS',
+                          'LATE_JOIN_DENY_COOLDOWN_SECONDS'],
         }
         result = []
         for section, keys in sections.items():

@@ -387,6 +387,13 @@ loadConfig()
         </div>
         <div class="setting-row">
           <div class="setting-label">
+            <span>Max Pending Join Requests</span>
+            <span class="setting-hint">Cap on the host's waiting list (0 = unlimited)</span>
+          </div>
+          <input type="number" v-model.number="config.MAX_PENDING_JOIN_REQUESTS" min="0" max="100" step="1" class="setting-input setting-input-sm" />
+        </div>
+        <div class="setting-row">
+          <div class="setting-label">
             <span>HLS Token Validation</span>
             <span class="setting-hint">Prevent direct stream access bypass</span>
           </div>
@@ -455,29 +462,29 @@ loadConfig()
         </div>
       </div>
 
-      <!-- Late Join Vote -->
+      <!-- Late Join Approval -->
       <div class="admin-card card">
-        <h2 class="card-title">Late Join Vote</h2>
+        <h2 class="card-title">Late Join Approval</h2>
         <div class="setting-row">
           <div class="setting-label">
-            <span>Enable Late Join Vote</span>
-            <span class="setting-hint">Require a majority vote to admit users who join mid-playback</span>
+            <span>Host Approval for Late Joins</span>
+            <span class="setting-hint">Queue users who join mid-playback until the host admits or declines them</span>
           </div>
-          <ToggleSwitch v-model="config.LATE_JOIN_VOTE_ENABLED" />
+          <ToggleSwitch v-model="config.LATE_JOIN_APPROVAL_ENABLED" />
         </div>
         <div class="setting-row">
           <div class="setting-label">
-            <span>Vote Timeout (s)</span>
-            <span class="setting-hint">Seconds before selector tiebreak kicks in</span>
+            <span>Request Timeout (s)</span>
+            <span class="setting-hint">How long a request stays in the host's list (0 = never expires)</span>
           </div>
-          <input type="number" v-model.number="config.LATE_JOIN_VOTE_TIMEOUT_SECONDS" min="5" max="300" step="1" class="setting-input setting-input-sm" />
+          <input type="number" v-model.number="config.LATE_JOIN_REQUEST_TIMEOUT_SECONDS" min="0" max="3600" step="1" class="setting-input setting-input-sm" />
         </div>
         <div class="setting-row">
           <div class="setting-label">
-            <span>Post-Vote Cooldown (s)</span>
-            <span class="setting-hint">Delay after a failed vote before another join attempt is allowed (0 disables)</span>
+            <span>Decline Cooldown (s)</span>
+            <span class="setting-hint">Applied only after the host explicitly declines (0 disables; dismissing a notification never applies it)</span>
           </div>
-          <input type="number" v-model.number="config.LATE_JOIN_VOTE_COOLDOWN_SECONDS" min="0" max="600" step="1" class="setting-input setting-input-sm" />
+          <input type="number" v-model.number="config.LATE_JOIN_DENY_COOLDOWN_SECONDS" min="0" max="600" step="1" class="setting-input setting-input-sm" />
         </div>
       </div>
     </div>

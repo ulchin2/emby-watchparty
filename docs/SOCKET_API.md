@@ -19,7 +19,7 @@ proxy, admin config) see the auto-generated OpenAPI docs at
   connection, lost on disconnect.
 - **`client_id`** = stable per-browser identifier from
   `localStorage`. Survives page refreshes, brief disconnects, and
-  browser-tab transitions. Used for selector identity, vote
+  browser-tab transitions. Used for selector identity, join-request
   attribution, host-reclaim grace, and rejoin detection.
 - **`party_id`** = uppercase 5-character code, e.g. `K7N2F`.
   Always normalised to upper-case on inbound.
@@ -97,9 +97,11 @@ Fires on socket close. The handler:
    schedule `_clear_host_after_grace(party_id, client_id, username)`
    for 5 seconds later. If the same `client_id` rejoins within the
    grace window, the grace task cancels and `host_reclaimed` fires.
-2. **Vote cleanup** -- if a late-joiner vote is in progress and the
-   departing user is either the joiner or an eligible voter, the
-   vote re-evaluates with the smaller eligible set.
+2. **Join-request cleanup** -- if the departing socket was waiting
+   in the approval queue, its request is removed and
+   `join_request_resolved {action:"cancelled"}` is broadcast. This is
+   not a decline and never starts a cooldown; a page reload simply
+   re-queues the request.
 3. **Per-user transcode stop** -- reports `Stopped` to Emby and
    stops the user's HLS transcode session.
 4. **Members + ready-check cleanup** -- removes the sid from
@@ -122,7 +124,7 @@ listener that re-emits `join_party` with the persistent
 initial handshake, which `party.join()` covers). Because
 `client_id` is stable, the server takes the known-participant
 fast path in `join_party` -- state migrates via `_replace_sid`,
-no late-joiner vote fires, a fresh `sync_state` is sent to the
+no join-approval request fires, a fresh `sync_state` is sent to the
 reconnected sid.
 
 External socket clients MUST implement the same re-emit on
@@ -143,8 +145,9 @@ The client binds itself to a party room after the HTTP join.
 socket.emit('join_party', {
   party_id: 'K7N2F',
   client_id: 'browser-uuid',
-  display_name: 'andrew',
+  username: 'andrew',
   avatar_uuid: 'avatar-uuid',  // optional
+  video_codecs: ['h264', 'hevc'],  // optional capability hint
 })
 ```
 
@@ -155,50 +158,58 @@ socket.emit('join_party', {
   rejoiner), migrates state from the old sid via `_replace_sid`
   (drift strikes, ready-check membership, `user_streams` ownership,
   `current_video.selected_by` if matching, Emby session cleanup
-  for the stale stream). **Skips the late-joiner vote** even if
+  for the stale stream). **Skips the join-approval queue** even if
   a video is playing.
-- If `client_id` is unknown AND a video is playing AND late-join
-  vote is enabled (`LATE_JOIN_VOTE_ENABLED`), starts a vote
-  (`join_vote_started` to existing members, `join_vote_pending`
-  to the joiner).
-- If `MAX_USERS_PER_PARTY` is exceeded, emits `join_rejected` to
-  the joiner with `reason: "party_full"` and does not add them.
-- On a clean join (no vote, no rejection), emits `user_joined`
+- If `client_id` is unknown AND a video is playing AND approval is
+  enabled (`LATE_JOIN_APPROVAL_ENABLED`) AND the party has an active
+  host, the socket is put in the party room but **not** in
+  `party["users"]`. A request is added to `party["join_requests"]`,
+  the joiner gets `join_request_pending`, and the room gets
+  `join_requests_update`. Re-joining from the same `client_id`
+  refreshes the existing entry instead of duplicating it.
+- If the party has no active host (host left / grace window), the
+  gate is skipped and the joiner is admitted through the normal
+  late-join path so they are not stranded in a queue nobody can
+  clear.
+- If `MAX_USERS_PER_PARTY` is exceeded, emits `error` to the joiner
+  and does not add them. The queue counts toward the cap.
+- On a clean join (no approval, no rejection), emits `user_joined`
   to the room and `sync_state` privately to the new joiner with
-  the current playback state.
+  the current playback state, including the current
+  `join_requests` queue.
 
-### `join_vote`
+### `join_request_decision`
 
-Sent by an existing member to cast their vote in an active
-late-joiner vote.
+Sent by the **host** to admit or decline one queued request. The
+authoritative queue lives on the server, so this works after a page
+reload or after the notification was dismissed.
 
 ```js
-socket.emit('join_vote', {
+socket.emit('join_request_decision', {
   party_id: 'K7N2F',
-  vote: 'yes',  // or 'no'
+  request_id: 'request-id-from-join_requests_update',
+  action: 'approve',  // or 'deny'
 })
 ```
 
 **Behaviour:**
 
-- Records the vote keyed on `sid` (transient session id, not
-  `client_id`). The vote lifetime is bounded by the timeout
-  watchdog, so a mid-vote disconnect is handled by
-  `_handle_disconnect_from_vote` in the disconnect handler.
-- Broadcasts `join_vote_update` with the running tally as
-  `{ votes: { username: 'yes' / 'no' }, remaining }` (sids are
-  converted to display names before broadcast).
-- If a strict majority emerges (yes wins -> vote_pass, no wins ->
-  vote_fail), resolves immediately. Pass restarts the video from
-  the beginning so the late joiner lands on segment 0. Fail
-  emits `join_vote_resolved {result:"fail"}` and `join_rejected`
-  to the would-be joiner.
-- If everyone has voted but no strict majority was reached (e.g.
-  1-1), the selector's vote tiebreaks immediately (no waiting
-  for the full timeout). If the selector abstains or is gone,
-  the default is `fail`.
-- Failed votes set `join_cooldown_until = now + LATE_JOIN_VOTE_COOLDOWN_SECONDS`
-  to prevent URL-spam griefing.
+- Server verifies the caller's `sid` maps to the party's
+  `host_client_id`; any other member receives `error` and the request
+  is untouched.
+- `approve` removes the request, broadcasts
+  `join_request_resolved {action:"approved"}`, then runs the normal
+  late-join path: the joiner is added to `party["users"]`,
+  `user_joined` is broadcast, and the joiner privately receives a
+  fresh `sync_state` with a per-user stream starting at the current
+  party position. The video is **not** restarted for everyone.
+- `deny` removes the request, broadcasts
+  `join_request_resolved {action:"denied"}`, emits `join_rejected`
+  to the joiner, and evicts them from the socket room. A cooldown is
+  applied only when `LATE_JOIN_DENY_COOLDOWN_SECONDS > 0`, and only
+  to that `client_id` -- never to the room.
+- Unknown/stale `request_id` is a no-op apart from re-broadcasting
+  the current queue (double-click safe).
 
 ### `leave_party`
 
@@ -505,7 +516,7 @@ no-op.
 | `video_selected` | `to=sid` (per-user) | A video was picked; each user gets their own stream URL | `{ video: { item_id, title, overview, stream_url, audio_index, subtitle_index, media_source_id, selected_by, quality } }` |
 | `streams_changed` | `to=sid` | The caller's `change_streams` produced a new per-user stream | `{ video: {...}, current_time, was_playing }` |
 | `video_stopped` | `room` | `stop_video` succeeded | `{ message, stopped_by }` |
-| `video_ended` | `room` | A member's player fired `ended` (or a vote-pass restart triggered it) | `{}` |
+| `video_ended` | `room` | A member's player fired `ended` | `{}` |
 | `play` | `room`, `skip_sid` | A member hit play | `{ time, username }` |
 | `pause` | `room`, `skip_sid` | A member hit pause | `{ time, username }` |
 | `seek` | `room`, `skip_sid` (or full room if mid-playback) | A member dragged the scrubber / hit a jump button | `{ time, playing, username, wait_for_ready?: true }` |
@@ -519,15 +530,14 @@ no-op.
 | `all_ready` | `room` | Every expected sid has reported `stream_ready` | `{ time, playing }` |
 | `drift_correction` | `to=sid` | Heartbeat showed >3s drift for 2 consecutive cycles | `{ time }` |
 
-### Late-joiner vote
+### Late-join approval
 
 | Event | Scope | When | Payload |
 |---|---|---|---|
-| `join_vote_started` | `room`, `skip_sid=joiner` | Late joiner triggered a vote | `{ username, timeout_seconds, eligible_voters[], required_majority }` |
-| `join_vote_pending` | `to=sid` (the joiner) | The joiner is waiting in the lobby | `{ timeout_seconds, eligible_voters[], required_majority }` |
-| `join_vote_update` | `room` | A new vote came in; running tally | `{ votes: { username: 'yes' / 'no' }, remaining }` |
-| `join_vote_resolved` | `room` | Vote concluded (pass / fail / cancelled) | `{ result: 'pass' / 'fail' / 'cancelled', reason? }` |
-| `join_rejected` | `to=sid` (the joiner) | Vote failed, party was full, cooldown active, or vote already in progress | `{ message, retry_after? }` |
+| `join_requests_update` | `room` | A request was added, refreshed, resolved, or expired; also the full queue | `{ requests: [{ id, username, avatar_uuid, requested_at, waiting_seconds, timeout_seconds }], timeout_seconds }` |
+| `join_request_pending` | `to=sid` (the joiner) | This client is now waiting for the host | `{ id, username, avatar_uuid, requested_at, waiting_seconds, timeout_seconds }` |
+| `join_request_resolved` | `room` | A request was approved, denied, cancelled, or expired | `{ request_id, username, action: 'approved' / 'denied' / 'cancelled' / 'expired' }` |
+| `join_rejected` | `to=sid` (the joiner) | Host declined, request expired, queue/party full, or decline cooldown active | `{ message, retry_after? }` |
 
 ### Binge-watch / auto-advance
 
@@ -599,26 +609,27 @@ client (any)                    server                          all clients
   |                              | --- all_ready ----------------->| (everyone resumes)
 ```
 
-### Late-joiner vote (video already playing)
+### Late join with host approval (video already playing)
 
 ```
-joiner          server                              existing members
+joiner          server (host + room)                host
   | --- join_party ------------->|
-  |                              | new client_id, video active
-  |                              | starts vote
-  | <-- join_vote_pending -------|
-  |                              | --- join_vote_started -------->|
-  |                                                               |
-  |                                                               | (existing members emit join_vote)
-  |                              | <- join_vote (from each)
-  |                              | --- join_vote_update --------->|
-  |                              |
-  |                              | majority reaches:
-  |                              | --- join_vote_resolved {pass}->|
-  |                              | restarts video from 0
-  |                              | --- video_selected (per user)->| (incl. joiner)
-  |                              | --- ready_check_update ------->|
+  |                              | new client_id, video active, host present
+  |                              | queue request (joiner NOT in users)
+  | <-- join_request_pending ----|
+  |                              | --- join_requests_update ------>| (host list + toast)
+  |                              |                                |
+  |                              | <-- join_request_decision ------| (approve / deny)
+  |                              | remove request
+  |                              | --- join_request_resolved --->  | (approved)
+  |                              | add joiner to users
+  | <-- user_joined (room) ------|-------------------------------->|
+  | <-- sync_state (to=sid) -----| (stream at current position; no room restart)
 ```
+
+Dismissing the toast, clicking outside it, or closing the list is a
+local UI action only: no socket event is sent, the request stays in
+`join_requests`, and no cooldown is recorded.
 
 ### Host disconnect + reclaim
 
@@ -669,11 +680,15 @@ host                            server                          remaining member
   inbound `seek` events are dropped until the check resolves.
   Frontends should suppress stray `seeked` browser events during
   the buffering phase.
-- **Vote eligibility snapshots at vote start.** Joining or leaving
-  during a vote re-evaluates majority but does not change the
-  eligible set (the joiner who can't vote isn't eligible
-  themselves; people who leave mid-vote shrink the eligible set
-  via the disconnect handler).
+- **The join-request queue is party state, not an event.** It lives
+  in `party["join_requests"]` and is included in every `sync_state`,
+  so a host reload (or a host promotion) does not lose pending
+  requests. Dismissing a notification never resolves a request;
+  only `join_request_decision`, a joiner disconnect, or the request
+  timeout removes an entry.
+- **Admission does not restart the movie.** An approved joiner gets
+  a per-user stream starting at the current party position, exactly
+  like a normal late join. Existing viewers keep playing.
 - **Host grace is 5 seconds.** A refresh / brief network blip
   preserves host status; a real disconnect collapses to
   PLAYING-ONLY or LOCKED depending on whether a video is in

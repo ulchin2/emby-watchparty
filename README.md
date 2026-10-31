@@ -84,7 +84,7 @@ Thanks to **@stealthydruid** and **@xyxxyxxy** for the bug reports and feature r
 - **Secure proxy architecture**: your Emby server stays on the local network; only the WatchParty app is exposed
 - **FastAPI + Vue 3 + TypeScript stack**: async end-to-end, typed OpenAPI docs at `/docs` and `/redoc`, single uvicorn process serves backend + compiled SPA
 - **Real-time sync with drift correction**: selector-authoritative play/pause/seek against a party clock, keeping independent streams aligned
-- **Late-joiner voting flow**: existing users vote to admit mid-playback joiners; a passing vote restarts on a PTS-aligned segment 0 so everyone lands together
+- **Host-approved late joins**: mid-playback joiners land in a persistent Join requests list; the host admits or declines, and dismissing the notification never rejects or starts a cooldown. Admitted viewers start at the current position, so nobody is yanked back to 0:00
 - **Host-provider auth model**: UNLOCKED / PLAYING-ONLY / LOCKED lock states around the Emby-authenticated host, with a grace window for quick refreshes
 - **Per-user transcodes**: every viewer gets their own Emby `PlaySessionId`, so audio, subtitles, quality, and version are personal without disrupting the room
 - **Multi-version playback**: host-locked picker for items with multiple MediaSources (theatrical vs director's cut, mp4 vs mkv, 1080p vs 4K HDR)
@@ -184,7 +184,7 @@ before rejoining.
    cp .env.example .env
    ```
 
-   Only boot-essential settings live in `.env` - see [`.env.example`](.env.example) for the full annotated list (bind/port, `APP_PREFIX`, `SESSION_SECRET`, `SESSION_COOKIE_SECURE`, `CORS_ALLOWED_ORIGINS`, `EMBY_SERVER_URL`, `EMBY_API_KEY`). All other runtime options (logging, rate limits, late-join vote, `FORCE_TRANSCODE`, `REQUIRE_LOGIN`, etc.) are managed live from the Admin Panel at `/admin` and persisted to `config.json`.
+   Only boot-essential settings live in `.env` - see [`.env.example`](.env.example) for the full annotated list (bind/port, `APP_PREFIX`, `SESSION_SECRET`, `SESSION_COOKIE_SECURE`, `CORS_ALLOWED_ORIGINS`, `EMBY_SERVER_URL`, `EMBY_API_KEY`). All other runtime options (logging, rate limits, late-join approval, `FORCE_TRANSCODE`, `REQUIRE_LOGIN`, etc.) are managed live from the Admin Panel at `/admin` and persisted to `config.json`.
 
 4. **Run the application** from the repository root:
 
@@ -279,7 +279,7 @@ In both modes, when the host disconnects mid-playback the in-flight video keeps 
 3. Enter your username
 4. Start watching together!
 
-If you join **before** a video has been selected, you land directly in the party. If you join **while a video is already playing**, the existing users will see a vote modal asking whether to restart the video from the beginning so you can join in sync. See the [project wiki](https://github.com/Oratorian/emby-watchparty/wiki) for full details of the late-joiner vote flow.
+If you join **before** a video has been selected, you land directly in the party. If you join **while a video is already playing**, your request appears in the host's **Join requests** list. The host gets a non-blocking notification with **Admit** / **Later**; dismissing it, clicking outside it, or closing the list does **not** reject you. You enter automatically when admitted, at the current playback position, without restarting the movie for everyone.
 
 ### In-party controls
 
@@ -352,13 +352,14 @@ Runtime, hot-reloadable. All of the following settings are editable at `/admin`.
 | Static session mode | Auto-create a fixed party on startup | `false` |
 | Static session ID | Party code when static mode is enabled | `PARTY` |
 
-**Late join vote** _(new in 2.0)_
+**Late join approval**
 
 | Setting | Description | Default |
 |---|---|---|
-| Enable late join vote | Require a majority vote to admit users who join mid-playback | `true` |
-| Vote timeout (s) | Seconds before the selector tiebreak kicks in | `20` |
-| Post-vote cooldown (s) | Delay after a failed vote before another join attempt is allowed (0 disables) | `30` |
+| Host approval for late joins | Queue users who join mid-playback until the host admits or declines them | `true` |
+| Request timeout (s) | How long a request stays in the host's Join requests list (0 = never expires) | `300` |
+| Decline cooldown (s) | Applied only after the host explicitly declines; dismissing the notification or closing the list never applies it (0 disables) | `0` |
+| Max pending join requests | Cap on the host's waiting list (0 = unlimited) | `10` |
 
 ## Architecture
 
@@ -390,7 +391,7 @@ There is no application user database. Any party member can promote themselves t
 
 ### Key components
 
-- **`PartyManager`** - party lifecycle, sid <-> client_id mapping, host state machine, ready-check and late-join vote bookkeeping.
+- **`PartyManager`** - party lifecycle, sid <-> client_id mapping, host state machine, ready-check and late-join request-queue bookkeeping.
 - **`EmbyClient`** - thin async wrapper around Emby's REST API (auth, items, playback reporting, encoding teardown).
 - **`HLSTokenManager`** - mints and validates short-lived per-user HLS URL tokens.
 - **`StreamBuilder`** - assembles per-user transcode URLs, honouring the `FORCE_TRANSCODE` admin toggle.
@@ -428,7 +429,7 @@ See `/docs` for the full parameter, response, and auth-scope details.
 Mounted under `${APP_PREFIX}/socket.io`. Events group into these categories:
 
 - **Connection lifecycle** - `connect` / `disconnect` / `connected`, transparent reconnect via stable `client_id`.
-- **Party join / leave / vote** - `join_party`, `leave_party`, `user_joined` / `user_left`, plus the late-joiner vote (`join_vote`, `join_vote_started`, `join_vote_update`, `join_vote_resolved`, `join_rejected`).
+- **Party join / leave / approval** - `join_party`, `leave_party`, `user_joined` / `user_left`, plus the host-approved late-join queue (`join_request_decision`, `join_requests_update`, `join_request_pending`, `join_request_resolved`, `join_rejected`).
 - **Host state** - `host_changed`, `host_left`, `host_reclaimed`, three-state lock (UNLOCKED / PLAYING-ONLY / LOCKED).
 - **Playback** - `select_video`, `stop_video`, `change_streams` (per-user), `play`, `pause`, `seek`, `video_selected`, `streams_changed`, `video_stopped`, `video_ended`.
 - **Sync coordination** - `stream_ready`, `ready_check_update`, `all_ready`, `force_pause_before_seek`, `heartbeat` + `drift_correction`, `report_progress`.

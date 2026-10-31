@@ -1,6 +1,7 @@
-"""Party handlers: join_party, leave_party, join_vote + late-joiner vote lifecycle"""
+"""Party handlers: join_party, leave_party, host-approved join requests."""
 
 import asyncio
+import secrets
 import time
 from datetime import datetime
 from backend.src.quality import DEFAULT_QUALITY_ID
@@ -32,7 +33,6 @@ def register(ctx):
     logger = ctx['logger']
     party_manager = ctx['party_manager']
     token_manager = ctx['token_manager']
-    restart_video_from_beginning = ctx['restart_video_from_beginning']
     create_user_stream = ctx.get('create_user_stream')
     session_secret = ctx.get('session_secret')
 
@@ -57,12 +57,8 @@ def register(ctx):
         return _decode_session(environ, session_secret)
 
     # -------------------------------------------------------------------------
-    # Late-joiner vote helpers
+    # Shared party helpers
     # -------------------------------------------------------------------------
-
-    def _vote_usernames(party, sids):
-        """Convert a collection of sids to a list of display usernames."""
-        return [party["users"].get(s, "?") for s in sids]
 
     def _current_party_time(party):
         """Return the server's current best estimate of playback position."""
@@ -173,6 +169,10 @@ def register(ctx):
             "media_source_id": stream.get("media_source_id"),
             "selected_by": current_video.get("selected_by"),
             "quality": stream.get("quality", current_video.get("quality", DEFAULT_QUALITY_ID)),
+            # The frontend clamps Jump/Seek against this. Omitting it made
+            # every client-side clamp a no-op, so any member could seek
+            # the whole room past the end of the file.
+            "run_time_seconds": current_video.get("run_time_seconds"),
             # Carry the binge-watching metadata so a late joiner sees
             # the same control-strip button visibility and library
             # NEXT badge as the rest of the room.
@@ -184,190 +184,86 @@ def register(ctx):
             "next_item_title": current_video.get("next_item_title"),
         }, current_time
 
-    def _votes_by_username(party, votes_dict):
-        """Convert {sid: "yes"|"no"} to {username: "yes"|"no"} for client broadcasts."""
-        return {party["users"].get(sid, "?"): vote for sid, vote in votes_dict.items()}
+    # -------------------------------------------------------------------------
+    # Join request queue
+    #
+    # Mid-playback joins are no longer decided by a vote. A new viewer is
+    # held as a request in party["join_requests"] until the host admits or
+    # declines them. The queue is party state (not a transient event), so
+    # the host can dismiss the notification -- or reload the page -- and
+    # still find the request in the Join requests list. No cooldown is
+    # applied unless the host explicitly declines.
+    # -------------------------------------------------------------------------
 
-    async def _broadcast_vote_update(party, party_id):
-        """Emit the current vote state to the whole party room."""
-        pj = party.get("pending_join")
-        if not pj:
-            return
-        remaining = len(pj["eligible_voters"]) - len(pj["votes"])
-        await sio.emit("join_vote_update", {
-            "votes": _votes_by_username(party, pj["votes"]),
-            "remaining": remaining,
-        }, room=party_id)
+    def _join_request_timeout_seconds():
+        return max(0, int(getattr(config, "LATE_JOIN_REQUEST_TIMEOUT_SECONDS", 300) or 0))
 
-    async def _resolve_vote_pass(party_id):
-        """Vote passed: restart the video from the beginning for all users
-        (including the late joiner), and promote the late joiner to a full
-        party member."""
-        party = party_manager.get(party_id)
-        if not party:
-            return
-        pj = party.get("pending_join")
-        if not pj:
-            return
+    def _new_join_request_id(party):
+        while True:
+            request_id = secrets.token_urlsafe(6)
+            if request_id not in party.setdefault("join_requests", {}):
+                return request_id
 
-        late_sid = pj["sid"]
-        late_username = pj["username"]
-        client_id = pj.get("client_id") or f"sid:{late_sid}"
+    def _request_payload(request):
+        return {
+            "id": request["id"],
+            "username": request["username"],
+            "avatar_uuid": request.get("avatar_uuid"),
+            # Epoch milliseconds so the browser can compute "waiting for
+            # 0:42" without trusting its clock against a server ISO
+            # timestamp.
+            "requested_at": int(request["requested_at"] * 1000),
+            "waiting_seconds": max(0, int(time.time() - request["requested_at"])),
+            "timeout_seconds": _join_request_timeout_seconds(),
+        }
 
-        # Cancel the watchdog if still active (prevent it firing after resolution)
-        task = pj.get("timeout_task")
-        if task and not task.done():
+    def _join_requests_payload(party):
+        return {
+            "requests": [
+                _request_payload(request)
+                for request in (party.get("join_requests") or {}).values()
+            ],
+            "timeout_seconds": _join_request_timeout_seconds(),
+        }
+
+    async def _broadcast_join_requests(party, party_id):
+        await sio.emit("join_requests_update", _join_requests_payload(party), room=party_id)
+
+    def _drop_join_request(party, request_id, cancel_task=True):
+        request = (party.get("join_requests") or {}).pop(request_id, None)
+        if not request:
+            return None
+        task = request.get("timeout_task")
+        # Never cancel ourselves: _expire_join_request calls this with
+        # cancel_task=False precisely to avoid raising CancelledError at
+        # its next await (same failure mode the old vote watchdog had).
+        if (
+            cancel_task
+            and task
+            and not task.done()
+            and task is not asyncio.current_task()
+        ):
             task.cancel()
+        request["timeout_task"] = None
+        return request
 
-        logger.info(f"Vote passed in party {party_id}: restarting for late joiner {late_username}")
-
-        # Promote the late joiner to a full user so they participate in the
-        # restart. Until now they were only in the Socket.IO room but NOT in
-        # party["users"].
-        _replace_sid(party, None, late_sid, late_username, client_id)
-
-        # Clear pending_join BEFORE emitting resolution so a simultaneous join
-        # attempt from another user sees no active vote.
-        party["pending_join"] = None
-
-        # Tell everyone the vote resolved (they dismiss the modal / waiting room)
-        await sio.emit("join_vote_resolved", {"result": "pass"}, room=party_id)
-
-        # Emit user_joined so existing clients update their participant list
-        await sio.emit("user_joined", {
-            "username": late_username,
-            "users": list(party["users"].values()),
-            "members": party_manager.members_list(party_id),
-            "rejoin": False,
-        }, room=party_id)
-
-        # Restart the current video from segment 0. Use the existing
-        # current_video metadata to keep the same title/item_id.
-        cv = party.get("current_video")
-        if not cv:
-            logger.warning(f"Vote passed but no current_video in party {party_id}")
-            return
-
-        success = await restart_video_from_beginning(
-            party, party_id,
-            selector_client_id=cv.get("selected_by"),
-            item_id=cv["item_id"],
-            item_name=cv.get("title", "Unknown"),
-            item_overview=cv.get("overview", ""),
-            # Preserve the chosen alternate version across the
-            # vote-pass restart -- otherwise the post-vote re-pick
-            # would silently drop back to Emby's default source.
-            media_source_id=cv.get("media_source_id"),
-        )
-        if not success:
-            logger.error(f"Failed to restart video after vote pass in party {party_id}")
-
-    def _set_cooldown(party):
-        """Apply the post-vote cooldown to block new join attempts for a
-        short window. Used after failed/cancelled votes to prevent spam
-        attacks where a malicious user keeps hitting /party/<id>."""
-        cooldown = getattr(config, "LATE_JOIN_VOTE_COOLDOWN_SECONDS", 30)
-        if cooldown > 0:
-            party["join_cooldown_until"] = time.time() + cooldown
-
-    async def _resolve_vote_fail(party_id):
-        """Vote failed: reject the late joiner and leave existing users undisturbed."""
-        party = party_manager.get(party_id)
-        if not party:
-            return
-        pj = party.get("pending_join")
-        if not pj:
-            return
-
-        late_sid = pj["sid"]
-        late_username = pj["username"]
-
-        task = pj.get("timeout_task")
-        if task and not task.done():
-            task.cancel()
-
-        logger.info(f"Vote failed in party {party_id}: rejecting late joiner {late_username}")
-
-        party["pending_join"] = None
-        _set_cooldown(party)
-
-        # Tell the room the vote failed (closes the modal)
-        await sio.emit("join_vote_resolved", {"result": "fail"}, room=party_id)
-        # Tell the late joiner specifically they were rejected
-        await sio.emit("join_rejected", {
-            "message": "The party declined your request to join."
-        }, to=late_sid)
-        # Evict them from the Socket.IO room
-        try:
-            await sio.leave_room(late_sid, party_id)
-        except Exception:
-            pass
-
-    async def _apply_tiebreak(party_id):
-        """Apply the selector tiebreak rule. Called when everyone has voted
-        but no strict majority was reached, or when the timeout expires.
-
-        - Selector voted yes -> pass
-        - Selector voted no -> fail
-        - Selector did not vote (disconnected or abstained) -> default fail
-        """
-        party = party_manager.get(party_id)
-        if not party:
-            return
-        pj = party.get("pending_join")
-        if not pj:
-            return
-
-        selector_sid = pj.get("selector_sid")
-        selector_vote = pj["votes"].get(selector_sid) if selector_sid else None
-
-        if selector_vote == "yes":
-            logger.info(f"Tiebreak in {party_id}: selector said yes -> pass")
-            await _resolve_vote_pass(party_id)
+    def _schedule_join_request_timeout(party, party_id, request):
+        previous = request.get("timeout_task")
+        if previous and not previous.done():
+            previous.cancel()
+        timeout_seconds = _join_request_timeout_seconds()
+        if timeout_seconds > 0:
+            request["timeout_task"] = asyncio.create_task(
+                _expire_join_request(party_id, request["id"], timeout_seconds)
+            )
         else:
-            logger.info(f"Tiebreak in {party_id}: selector said {selector_vote or 'nothing'} -> fail")
-            await _resolve_vote_fail(party_id)
+            request["timeout_task"] = None
 
-    async def _check_vote_resolution(party_id):
-        """Check if the vote can be resolved now.
+    async def _expire_join_request(party_id, request_id, timeout_seconds):
+        """Drop a request nobody acted on and let the joiner retry.
 
-        Resolution cases:
-        - Strict majority yes -> pass immediately
-        - Strict majority no -> fail immediately
-        - Everyone has voted but no strict majority -> apply tiebreak now
-          (don't make users wait for the full timeout)
-        - Otherwise keep waiting for more votes or the timeout watchdog.
-        """
-        party = party_manager.get(party_id)
-        if not party:
-            return
-        pj = party.get("pending_join")
-        if not pj:
-            return
-
-        yes_count = sum(1 for v in pj["votes"].values() if v == "yes")
-        no_count = sum(1 for v in pj["votes"].values() if v == "no")
-        total_votes = yes_count + no_count
-        eligible = len(pj["eligible_voters"])
-        threshold = eligible // 2  # strict majority means > threshold
-
-        if yes_count > threshold:
-            await _resolve_vote_pass(party_id)
-        elif no_count > threshold:
-            await _resolve_vote_fail(party_id)
-        elif total_votes >= eligible:
-            # Every eligible voter has voted but no strict majority was
-            # reached (classic tie, e.g. 1-1 in a 2-user party). Apply
-            # the selector tiebreak right away instead of making everyone
-            # wait for the full timeout.
-            await _apply_tiebreak(party_id)
-        # Otherwise keep waiting. The watchdog handles timeouts/abstains.
-
-    async def _vote_timeout_watchdog(party_id, timeout_seconds):
-        """Wait timeout_seconds, then apply the selector tiebreak rule.
-
-        If the vote was already resolved early (by majority or tie-at-all-voted),
-        pending_join will be None and we return without doing anything.
+        An expiry is NOT a decline: no cooldown is recorded, so the same
+        person can request again immediately if the host is still there.
         """
         try:
             await asyncio.sleep(timeout_seconds)
@@ -377,133 +273,335 @@ def register(ctx):
         party = party_manager.get(party_id)
         if not party:
             return
-        pj = party.get("pending_join")
-        if not pj:
-            return  # Already resolved
+        request = (party.get("join_requests") or {}).get(request_id)
+        if not request:
+            return
 
-        logger.info(f"Vote timeout in party {party_id}")
-        # Drop our own task handle before resolving. _resolve_vote_pass /
-        # _resolve_vote_fail cancel pj["timeout_task"] to stop a pending
-        # watchdog, but here the watchdog IS the caller. Cancelling the
-        # running task would raise CancelledError at the next await (the
-        # join_vote_resolved emit), so the resolution would never reach the
-        # clients and the modal would hang forever.
-        pj["timeout_task"] = None
-        await _apply_tiebreak(party_id)
+        sid = request["sid"]
+        username = request["username"]
+        client_id = request.get("client_id")
+        _drop_join_request(party, request_id, cancel_task=False)
+        if client_id:
+            party.setdefault("client_codecs", {}).pop(client_id, None)
+        logger.info(
+            f"Join request expired in party {party_id} for {username} "
+            f"after {timeout_seconds}s"
+        )
+        await sio.emit("join_request_resolved", {
+            "request_id": request_id,
+            "username": username,
+            "action": "expired",
+        }, room=party_id)
+        await _broadcast_join_requests(party, party_id)
+        await sio.emit("join_rejected", {
+            "message": "The host did not respond to your request in time. You can try again."
+        }, to=sid)
+        try:
+            await sio.leave_room(sid, party_id)
+        except Exception:
+            pass
 
-    async def _start_late_join_vote(party, party_id, late_sid, late_username, client_id=None):
-        """Initialize a vote for a new late joiner. Returns True if the vote
-        started, False if a vote was already in progress."""
-        if party.get("pending_join") is not None:
-            return False
+    async def _enqueue_join_request(party, party_id, sid, username, client_id, avatar_uuid):
+        """Hold a mid-playback joiner in the queue.
 
-        # Snapshot eligible voters: everyone currently in the party
-        eligible_voters = set(party["users"].keys())
-        # current_video.selected_by holds the selector's persistent client_id,
-        # but votes are keyed by sid. Resolve the selector's *current* sid so
-        # the tiebreak rule can find their vote.
-        selector_sid = None
-        cv = party.get("current_video")
-        if cv:
-            selector_client_id = cv.get("selected_by")
-            if selector_client_id:
-                for s, cid in party.get("sid_client_ids", {}).items():
-                    if cid == selector_client_id:
-                        selector_sid = s
-                        break
+        Re-requesting from the same browser (reload / retry) updates the
+        existing entry in place instead of stacking duplicates. Returns
+        the request dict, or None when the queue was full (the caller has
+        already been told why).
+        """
+        requests = party.setdefault("join_requests", {})
+        timeout_seconds = _join_request_timeout_seconds()
 
-        timeout_seconds = getattr(config, "LATE_JOIN_VOTE_TIMEOUT_SECONDS", 20)
+        existing = next(
+            (r for r in requests.values() if r.get("client_id") == client_id),
+            None,
+        )
+        if existing:
+            old_sid = existing.get("sid")
+            if old_sid and old_sid != sid:
+                try:
+                    await sio.leave_room(old_sid, party_id)
+                except Exception:
+                    pass
+            existing.update({
+                "sid": sid,
+                "username": username,
+                "avatar_uuid": avatar_uuid,
+            })
+            existing["requested_at"] = time.time()
+            _schedule_join_request_timeout(party, party_id, existing)
+            await sio.enter_room(sid, party_id)
+            await sio.emit("join_request_pending", _request_payload(existing), to=sid)
+            await _broadcast_join_requests(party, party_id)
+            logger.info(
+                f"Join request refreshed in party {party_id} for {username} "
+                f"(id={existing['id']})"
+            )
+            return existing
 
-        party["pending_join"] = {
-            "sid": late_sid,
-            "username": late_username,
+        max_pending = max(0, int(getattr(config, "MAX_PENDING_JOIN_REQUESTS", 10) or 0))
+        if max_pending and len(requests) >= max_pending:
+            logger.info(
+                f"Join rejected in party {party_id}: {len(requests)} requests "
+                f"already pending (user: {username})"
+            )
+            await sio.emit("join_rejected", {
+                "message": (
+                    "Too many people are waiting to join right now. "
+                    "Please try again in a moment."
+                )
+            }, to=sid)
+            return None
+
+        request = {
+            "id": _new_join_request_id(party),
+            "sid": sid,
+            "username": username,
             "client_id": client_id,
-            "requested_at": datetime.now().isoformat(),
-            "eligible_voters": eligible_voters,
-            "votes": {},
-            "selector_sid": selector_sid,
+            "avatar_uuid": avatar_uuid,
+            "requested_at": time.time(),
             "timeout_task": None,
         }
+        requests[request["id"]] = request
 
-        # Put the late joiner into the Socket.IO room so they receive
-        # vote-progress broadcasts, but do NOT add them to party["users"]
-        # yet -- they are held in a pending state.
-        await sio.enter_room(late_sid, party_id)
+        # Put the joiner in the Socket.IO room so they receive queue
+        # updates, but deliberately keep them OUT of party["users"] until
+        # the host approves. That keeps them invisible to playback,
+        # ready-check and participant-count logic while waiting.
+        await sio.enter_room(sid, party_id)
+        _schedule_join_request_timeout(party, party_id, request)
+        await sio.emit("join_request_pending", _request_payload(request), to=sid)
+        await _broadcast_join_requests(party, party_id)
+        logger.info(
+            f"Join request queued in party {party_id} for {username} "
+            f"(id={request['id']}, timeout={timeout_seconds}s)"
+        )
+        return request
 
-        eligible_names = _vote_usernames(party, eligible_voters)
-        required_majority = (len(eligible_voters) // 2) + 1
+    async def _finalize_member_join(party, party_id, sid, username, client_id,
+                                    avatar_uuid, rejoin=False, old_sid=None,
+                                    reclaim_host=False):
+        """Add a socket to party["users"] and hand it a sync_state."""
+        await sio.enter_room(sid, party_id)
+        _replace_sid(party, old_sid, sid, username, client_id, avatar_uuid)
 
-        # Notify existing users (excluding the late joiner) that a vote started
-        await sio.emit("join_vote_started", {
-            "username": late_username,
-            "timeout_seconds": timeout_seconds,
-            "eligible_voters": eligible_names,
-            "required_majority": required_majority,
-        }, room=party_id, skip_sid=late_sid)
+        if reclaim_host:
+            try_host_reclaim = ctx.get("try_host_reclaim")
+            if try_host_reclaim:
+                await try_host_reclaim(party_id, client_id, sid)
 
-        # Notify the late joiner that they are in the waiting room
-        await sio.emit("join_vote_pending", {
-            "timeout_seconds": timeout_seconds,
-            "eligible_voters": eligible_names,
-            "required_majority": required_majority,
-        }, to=late_sid)
+        await sio.emit("user_joined", {
+            "username": username,
+            "users": list(party["users"].values()),
+            "members": party_manager.members_list(party_id),
+            "rejoin": rejoin,
+        }, room=party_id)
 
-        # Spawn the timeout watchdog
-        task = asyncio.create_task(_vote_timeout_watchdog(party_id, timeout_seconds))
-        party["pending_join"]["timeout_task"] = task
+        await _send_sync_state(party, party_id, sid)
+
+    def _pending_auto_advance_payload(party):
+        pending = party.get("pending_auto_advance")
+        if not pending:
+            return None
+        deadline = pending.get("deadline")
+        countdown_seconds = None
+        if deadline:
+            try:
+                remaining = (
+                    datetime.fromisoformat(deadline) - datetime.now()
+                ).total_seconds()
+                countdown_seconds = max(0, int(remaining))
+            except Exception:
+                countdown_seconds = None
+        episode_list = party.get("episode_list") or []
+        return {
+            "next_item_id": pending.get("next_item_id"),
+            "next_title": pending.get("next_title"),
+            "next_index_number": pending.get("next_index_number"),
+            "total_episodes": (
+                max((ep.get("IndexNumber") or 0) for ep in episode_list)
+                if episode_list else 0
+            ),
+            "deadline": deadline,
+            "countdown_seconds": countdown_seconds,
+        }
+
+    async def _send_sync_state(party, party_id, sid):
+        """Send the authoritative room state to one socket.
+
+        Also carries the current join-request queue so a host who reloads
+        the page sees pending requests immediately, not only when the
+        next request arrives.
+        """
+        current_video = None
+        playback_state = party["playback_state"].copy()
+        if party.get("current_video"):
+            # If video is active, create a fresh per-user stream at the
+            # current party position so reload/rejoin can resume without
+            # triggering an approval request or restarting everyone.
+            rejoin_video = await _build_rejoin_video(party, party_id, sid)
+            if rejoin_video:
+                current_video, current_time = rejoin_video
+                playback_state["time"] = current_time
+            else:
+                cv = party["current_video"]
+                current_video = {
+                    "item_id": cv.get("item_id"),
+                    "title": cv.get("title"),
+                    "overview": cv.get("overview"),
+                    "selected_by": cv.get("selected_by"),
+                    "run_time_seconds": cv.get("run_time_seconds"),
+                    "item_type": cv.get("item_type"),
+                    "series_id": cv.get("series_id"),
+                    "season_id": cv.get("season_id"),
+                    "episode_index": cv.get("episode_index"),
+                    "next_item_id": cv.get("next_item_id"),
+                    "next_item_title": cv.get("next_item_title"),
+                }
+
+        await sio.emit("sync_state", {
+            "current_video": current_video,
+            "playback_state": playback_state,
+            "binge_watch": {
+                "available": bool(config.BINGE_WATCH_ENABLED),
+                "active": bool(party.get("binge_watch_active")),
+            },
+            "pending_auto_advance": _pending_auto_advance_payload(party),
+            "join_requests": _join_requests_payload(party),
+        }, to=sid)
+
+    def _caller_is_host(party, sid):
+        """True when this socket belongs to the party's current host.
+
+        Mirrors the other host-only socket handlers (binge toggles,
+        library broadcast), which key on the persistent client_id rather
+        than the transient sid. The HTTP layer still owns the stronger
+        host_session_grant proof for admin routes.
+        """
+        client_id = party.get("sid_client_ids", {}).get(sid)
+        return bool(client_id) and client_id == party.get("host_client_id")
+
+    def _denied_retry_after(party, client_id):
+        denied = party.setdefault("join_denied_until", {})
+        now = time.time()
+        # Prune expired entries while we are here so the dict cannot grow
+        # without bound over a long-lived party.
+        for cid, until in list(denied.items()):
+            if until <= now:
+                denied.pop(cid, None)
+        until = denied.get(client_id, 0)
+        if until > now:
+            return int(until - now) + 1
+        return 0
+
+    async def _admit_join_request(party, party_id, request, decided_by=None):
+        request_id = request["id"]
+        username = request["username"]
+        sid = request["sid"]
+        client_id = request.get("client_id") or f"sid:{sid}"
+
+        _drop_join_request(party, request_id)
+        logger.info(
+            f"Join request approved in party {party_id} for {username} "
+            f"(id={request_id}, by {decided_by or 'system'})"
+        )
+        await sio.emit("join_request_resolved", {
+            "request_id": request_id,
+            "username": username,
+            "action": "approved",
+        }, room=party_id)
+        await _broadcast_join_requests(party, party_id)
+
+        # Admission is the normal late-join path: the new viewer gets a
+        # per-user stream starting at the current party position. No
+        # video restart, so approving someone mid-movie does not yank
+        # everyone else back to 0:00.
+        await _finalize_member_join(
+            party, party_id, sid, username, client_id,
+            request.get("avatar_uuid"), rejoin=False,
+        )
+
+    async def _deny_join_request(party, party_id, request, decided_by=None):
+        request_id = request["id"]
+        username = request["username"]
+        sid = request["sid"]
+        client_id = request.get("client_id")
+
+        _drop_join_request(party, request_id)
+
+        cooldown = max(0, int(getattr(config, "LATE_JOIN_DENY_COOLDOWN_SECONDS", 0) or 0))
+        if cooldown > 0 and client_id:
+            party.setdefault("join_denied_until", {})[client_id] = time.time() + cooldown
 
         logger.info(
-            f"Started late join vote in party {party_id} for {late_username} "
-            f"(eligible={len(eligible_voters)}, timeout={timeout_seconds}s)"
+            f"Join request declined in party {party_id} for {username} "
+            f"(id={request_id}, by {decided_by or 'system'})"
         )
-        return True
+        await sio.emit("join_request_resolved", {
+            "request_id": request_id,
+            "username": username,
+            "action": "denied",
+        }, room=party_id)
+        await _broadcast_join_requests(party, party_id)
+        await sio.emit("join_rejected", {
+            "message": "The host declined your request to join."
+        }, to=sid)
+        try:
+            await sio.leave_room(sid, party_id)
+        except Exception:
+            pass
+        # The rejected client never became a participant, but join_party
+        # records codec support before the approval gate. Drop it so a
+        # stream of rejected attempts cannot grow the map.
+        if client_id:
+            party.setdefault("client_codecs", {}).pop(client_id, None)
 
-    async def _handle_disconnect_from_vote(party, party_id, sid):
-        """Handle a disconnect or leave during an active vote.
-
-        Called from both disconnect and leave_party paths. Modifies
-        eligible_voters/votes and re-checks resolution if needed.
-        """
-        pj = party.get("pending_join")
-        if not pj:
-            return
-
-        # Case 1: the disconnecting user IS the late joiner
-        if pj["sid"] == sid:
-            logger.info(f"Late joiner {pj['username']} disconnected mid-vote in {party_id}")
-            # Cancel the watchdog
-            task = pj.get("timeout_task")
-            if task and not task.done():
-                task.cancel()
-            party["pending_join"] = None
-            # Apply cooldown to prevent spam (same user immediately rejoining
-            # and spawning another vote, e.g. after a force-reload)
-            _set_cooldown(party)
-            # Tell existing users the vote was cancelled because the joiner left
-            await sio.emit("join_vote_resolved", {
-                "result": "cancelled",
-                "reason": "Late joiner left before the vote completed.",
+    async def _handle_join_request_sid_gone(party, party_id, sid):
+        """Remove a request whose socket left (reload, tab close, leave)."""
+        for request in list((party.get("join_requests") or {}).values()):
+            if request.get("sid") != sid:
+                continue
+            request_id = request["id"]
+            username = request["username"]
+            client_id = request.get("client_id")
+            _drop_join_request(party, request_id)
+            if client_id:
+                party.setdefault("client_codecs", {}).pop(client_id, None)
+            logger.info(
+                f"Join request cancelled in party {party_id} for {username} "
+                f"(id={request_id}, socket left)"
+            )
+            await sio.emit("join_request_resolved", {
+                "request_id": request_id,
+                "username": username,
+                "action": "cancelled",
             }, room=party_id)
+            await _broadcast_join_requests(party, party_id)
+            try:
+                await sio.leave_room(sid, party_id)
+            except Exception:
+                pass
+            return request
+        return None
+
+    async def _flush_pending_join_requests(party, party_id):
+        """Admit queued viewers when the party has no active host.
+
+        Nobody is left to approve them, and holding the queue hostage to
+        a departed host would strand the joiners until the timeout. The
+        same fallback covers host step-down and the host grace expiry.
+        """
+        if party.get("host_client_id") and party.get("host_left_at") is None:
             return
+        for request in list((party.get("join_requests") or {}).values()):
+            if party.get("host_client_id") and party.get("host_left_at") is None:
+                break
+            await _admit_join_request(party, party_id, request, decided_by="host_left")
 
-        # Case 2: the disconnecting user is an eligible voter
-        if sid in pj["eligible_voters"]:
-            pj["eligible_voters"].discard(sid)
-            pj["votes"].pop(sid, None)
-            # If the selector left mid-vote, clear the tiebreak authority
-            if pj.get("selector_sid") == sid:
-                pj["selector_sid"] = None
-
-            # If nobody is left to vote, fail the vote
-            if not pj["eligible_voters"]:
-                await _resolve_vote_fail(party_id)
-                return
-
-            await _broadcast_vote_update(party, party_id)
-            await _check_vote_resolution(party_id)
-
-    # Expose vote helpers in ctx so connection.py can reuse them during disconnect
-    ctx['handle_disconnect_from_vote'] = _handle_disconnect_from_vote
+    # Expose helpers in ctx so connection.py can keep the queue in sync
+    # when a socket drops or the host grace window expires.
+    ctx['handle_join_request_sid_gone'] = _handle_join_request_sid_gone
+    ctx['flush_pending_join_requests'] = _flush_pending_join_requests
 
     # -------------------------------------------------------------------------
     # Event handlers
@@ -544,234 +642,236 @@ def register(ctx):
         rejoin = known_participant
         old_sid = participants.get(client_id, {}).get("sid")
 
+        # A pending request from this same browser (page reload, retry,
+        # second tab) is reused rather than duplicated.
+        pending_request = next(
+            (
+                request
+                for request in (party.get("join_requests") or {}).values()
+                if request.get("client_id") == client_id
+            ),
+            None,
+        )
+
         if known_participant:
+            # Reattach: move this client's party state to the new socket.
+            # No approval request fires for someone who is already a
+            # member, which is what makes a refresh mid-movie safe.
             if old_sid and old_sid != sid:
                 await sio.leave_room(old_sid, party_id)
                 logger.info(f"Reattached participant {username} in {party_id}: {old_sid} -> {sid}")
-            _replace_sid(party, old_sid, sid, username, client_id, avatar_uuid)
-        else:
-            # Historically this evicted any existing member with a
-            # matching display name (with a different client_id) so
-            # duplicate-tab / lost-client_id refreshes would land on
-            # their seat. But username is a public string and there is
-            # no party password, so anyone knowing (party code, member
-            # name) could kick the real member off their seat, inherit
-            # their ready_check membership, and DoS their Emby transcode
-            # via _replace_sid's teardown.
-            #
-            # Gate the eviction on a valid session cookie carrying the
-            # SAME client_id as the joiner. HTTP /api/party/<id>/join
-            # is the only route that mints those cookies, and it stores
-            # the caller-supplied client_id verbatim -- so a legitimate
-            # duplicate-tab / same-browser user matches, but a random
-            # attacker with just the party code + username does not.
-            environ = sio.get_environ(sid) or {}
-            cookie_session = _cookie_session(environ)
-            cookie_client_id = cookie_session.get("client_id") if cookie_session else None
-            cookie_party_id = (cookie_session.get("party_id") or "").upper() if cookie_session else ""
-            same_browser = (
-                cookie_client_id == client_id and cookie_party_id == party_id
+            if pending_request:
+                # Stale request left over from before this client became
+                # a member; drop it so it cannot resurface later.
+                _drop_join_request(party, pending_request["id"])
+                await _broadcast_join_requests(party, party_id)
+            await _finalize_member_join(
+                party, party_id, sid, username, client_id, avatar_uuid,
+                rejoin=True, old_sid=old_sid, reclaim_host=True,
             )
-            for stale_sid, existing_name in list(party["users"].items()):
-                if existing_name == username and stale_sid != sid:
-                    if not same_browser:
-                        logger.warning(
-                            f"Join eviction REJECTED in {party_id}: "
-                            f"caller sid={sid} lacks session-cookie proof "
-                            f"for username '{username}'; refusing to evict "
-                            f"stale_sid={stale_sid}"
-                        )
-                        await sio.emit("error", {
-                            "message": (
-                                "That username is already in use. Pick "
-                                "another display name."
-                            )
-                        }, to=sid)
-                        return
-                    stale_client_id = sid_client_ids.get(stale_sid)
-                    if stale_client_id:
-                        participants.pop(stale_client_id, None)
-                    await sio.leave_room(stale_sid, party_id)
-                    _replace_sid(party, stale_sid, sid, username, client_id, avatar_uuid)
-                    rejoin = True
-                    logger.info(f"Evicted stale session {stale_sid} for {username}")
-                    break
-
-        # Check max users (count includes any pending late joiner)
-        current_count = len(party["users"])
-        if party.get("pending_join"):
-            current_count += 1
-        if not rejoin and config.MAX_USERS_PER_PARTY > 0 and current_count >= config.MAX_USERS_PER_PARTY:
-            logger.warning(f"Party {party_id} is full")
-            await sio.emit("error", {"message": f"Party is full (max {config.MAX_USERS_PER_PARTY} users)"}, to=sid)
             return
 
+        # Historically this evicted any existing member with a matching
+        # display name (with a different client_id) so duplicate-tab /
+        # lost-client_id refreshes would land on their seat. But username
+        # is a public string and there is no party password, so anyone
+        # knowing (party code, member name) could kick the real member
+        # off their seat, inherit their ready_check membership, and DoS
+        # their Emby transcode via _replace_sid's teardown.
+        #
+        # Gate the eviction on a valid session cookie carrying the SAME
+        # client_id as the joiner. HTTP /api/party/<id>/join is the only
+        # route that mints those cookies, and it stores the
+        # caller-supplied client_id verbatim -- so a legitimate
+        # duplicate-tab / same-browser user matches, but a random
+        # attacker with just the party code + username does not.
+        evicted_sid = None
+        environ = sio.get_environ(sid) or {}
+        cookie_session = _cookie_session(environ)
+        cookie_client_id = cookie_session.get("client_id") if cookie_session else None
+        cookie_party_id = (cookie_session.get("party_id") or "").upper() if cookie_session else ""
+        same_browser = (
+            cookie_client_id == client_id and cookie_party_id == party_id
+        )
+        for stale_sid, existing_name in list(party["users"].items()):
+            if existing_name == username and stale_sid != sid:
+                if not same_browser:
+                    logger.warning(
+                        f"Join eviction REJECTED in {party_id}: "
+                        f"caller sid={sid} lacks session-cookie proof "
+                        f"for username '{username}'; refusing to evict "
+                        f"stale_sid={stale_sid}"
+                    )
+                    await sio.emit("error", {
+                        "message": (
+                            "That username is already in use. Pick "
+                            "another display name."
+                        )
+                    }, to=sid)
+                    return
+                stale_client_id = sid_client_ids.get(stale_sid)
+                if stale_client_id:
+                    participants.pop(stale_client_id, None)
+                await sio.leave_room(stale_sid, party_id)
+                evicted_sid = stale_sid
+                rejoin = True
+                logger.info(f"Evicted stale session {stale_sid} for {username}")
+                break
+
         # -----------------------------------------------------------------
-        # Late joiner vote flow
+        # Mid-playback approval gate
         # -----------------------------------------------------------------
-        vote_enabled = getattr(config, "LATE_JOIN_VOTE_ENABLED", True)
+        approval_enabled = bool(getattr(config, "LATE_JOIN_APPROVAL_ENABLED", True))
         has_active_video = party.get("current_video") is not None
         has_existing_users = len(party["users"]) > 0
+        # An absent host (grace window running, or stepped down) must not
+        # strand a joiner in a queue nobody can clear. In that state the
+        # party falls back to the normal late-join path.
+        has_active_host = (
+            bool(party.get("host_client_id"))
+            and party.get("host_left_at") is None
+        )
+        needs_approval = (
+            not rejoin
+            and approval_enabled
+            and has_active_video
+            and has_existing_users
+            and has_active_host
+        )
 
-        if not rejoin and vote_enabled and has_active_video and has_existing_users:
-            # Don't start a second vote on top of an active one
-            if party.get("pending_join") is not None:
-                logger.info(f"Join rejected: vote already in progress in party {party_id}")
-                await sio.emit("join_rejected", {
-                    "message": "Another user is currently waiting for approval. Try again shortly.",
-                }, to=sid)
-                return
+        if pending_request and not needs_approval:
+            # The reason for holding them disappeared (video stopped, host
+            # left). Admit instead of making them wait for a decision that
+            # no longer has anything to protect.
+            if pending_request.get("sid") and pending_request["sid"] != sid:
+                try:
+                    await sio.leave_room(pending_request["sid"], party_id)
+                except Exception:
+                    pass
+            _drop_join_request(party, pending_request["id"])
+            await sio.emit("join_request_resolved", {
+                "request_id": pending_request["id"],
+                "username": pending_request["username"],
+                "action": "approved",
+            }, room=party_id)
+            await _broadcast_join_requests(party, party_id)
+            pending_request = None
 
-            # Enforce post-vote cooldown. Prevents a malicious user from
-            # spamming /party/<id> to repeatedly pop vote modals on the
-            # existing watchers.
-            cooldown_until = party.get("join_cooldown_until", 0) or 0
-            now = time.time()
-            if cooldown_until > now:
-                wait_seconds = int(cooldown_until - now) + 1
+        if pending_request and needs_approval:
+            # Same browser asking again while still queued: refresh the
+            # existing entry (new sid, same id) and keep the host's list
+            # stable instead of stacking duplicates.
+            await _enqueue_join_request(
+                party, party_id, sid, username, client_id, avatar_uuid,
+            )
+            return
+
+        # Check max users. Pending requests already occupy a slot so a
+        # queue cannot grow past the party cap while the host decides.
+        current_count = len(party["users"]) + len(party.get("join_requests") or {})
+        if pending_request:
+            current_count -= 1
+        if (
+            not rejoin
+            and config.MAX_USERS_PER_PARTY > 0
+            and current_count >= config.MAX_USERS_PER_PARTY
+        ):
+            logger.warning(f"Party {party_id} is full")
+            # join_rejected is the event PartyView turns into a visible
+            # alert + redirect. Plain `error` only reaches chat, which is
+            # hidden behind the join screen for someone who never joined.
+            await sio.emit("join_rejected", {
+                "message": f"Party is full (max {config.MAX_USERS_PER_PARTY} users)"
+            }, to=sid)
+            return
+
+        if needs_approval:
+            retry_after = _denied_retry_after(party, client_id)
+            if retry_after:
                 logger.info(
-                    f"Join rejected: cooldown active in party {party_id} "
-                    f"({wait_seconds}s remaining, user: {username})"
+                    f"Join rejected: decline cooldown active in party {party_id} "
+                    f"({retry_after}s remaining, user: {username})"
                 )
                 await sio.emit("join_rejected", {
                     "message": (
-                        f"The party is on cooldown after a recent vote. "
-                        f"Try again in {wait_seconds} seconds."
+                        f"The host declined a recent request. "
+                        f"Try again in {retry_after} seconds."
                     ),
-                    "retry_after": wait_seconds,
+                    "retry_after": retry_after,
                 }, to=sid)
                 return
 
-            # Start the vote -- this puts the late joiner into the Socket.IO
-            # room but does NOT add them to party["users"] yet.
-            started = await _start_late_join_vote(party, party_id, sid, username, client_id)
-            if started:
-                return  # Vote flow takes over; no immediate sync_state
+            # Hold the joiner in the request queue. The host keeps a
+            # persistent list; dismissing the notification does not
+            # reject anybody and does not start a cooldown.
+            await _enqueue_join_request(
+                party, party_id, sid, username, client_id, avatar_uuid,
+            )
+            return
 
-        # -----------------------------------------------------------------
-        # Normal join path (no active video, vote disabled, or empty party
-        # with a stale current_video from the static-session edge case)
-        # -----------------------------------------------------------------
-        await sio.enter_room(sid, party_id)
-        _replace_sid(party, old_sid if known_participant else sid, sid, username, client_id, avatar_uuid)
+        # Normal join path: no active video, approval disabled, empty
+        # party, no active host, or a same-browser reattach.
+        await _finalize_member_join(
+            party, party_id, sid, username, client_id, avatar_uuid,
+            rejoin=rejoin, old_sid=evicted_sid, reclaim_host=True,
+        )
 
-        # Fast host-rejoin path. If a grace task is pending because this
-        # client_id was hosting and just dropped, cancel it and tell the
-        # room the party is UNLOCKED again. No re-authentication needed.
-        try_host_reclaim = ctx.get('try_host_reclaim')
-        if try_host_reclaim:
-            await try_host_reclaim(party_id, client_id, sid)
+    @sio.on("join_request_decision")
+    async def handle_join_request_decision(sid, data):
+        """Host admits or declines one queued join request.
 
-        await sio.emit("user_joined", {
-            "username": username,
-            "users": list(party["users"].values()),
-            "members": party_manager.members_list(party_id),
-            "rejoin": rejoin,
-        }, room=party_id)
+        The queue itself lives on the party dict, so a decision is valid
+        even after the host reloaded the page or dismissed the toast.
+        """
+        party_id = str(data.get("party_id", "")).strip().upper()
+        request_id = str(data.get("request_id", "")).strip()
+        action = str(data.get("action", "")).strip().lower()
 
-        # Send a sync_state. If video is active, create a fresh per-user
-        # stream at the current party position so reload/rejoin can resume
-        # without triggering the late-join vote or restarting everyone.
-        current_video = None
-        playback_state = party["playback_state"].copy()
-        if party.get("current_video"):
-            rejoin_video = await _build_rejoin_video(party, party_id, sid)
-            if rejoin_video:
-                current_video, current_time = rejoin_video
-                playback_state["time"] = current_time
-            else:
-                cv = party["current_video"]
-                current_video = {
-                    "item_id": cv.get("item_id"),
-                    "title": cv.get("title"),
-                    "overview": cv.get("overview"),
-                    "selected_by": cv.get("selected_by"),
-                    "item_type": cv.get("item_type"),
-                    "series_id": cv.get("series_id"),
-                    "season_id": cv.get("season_id"),
-                    "episode_index": cv.get("episode_index"),
-                    "next_item_id": cv.get("next_item_id"),
-                    "next_item_title": cv.get("next_item_title"),
-                }
-
-        # Pending auto-advance state. A user who refreshes / rejoins
-        # while the binge countdown is running should see the modal +
-        # Cancel button. Without this block their client hydrates with
-        # pendingAutoAdvance=null, so the modal never renders and the
-        # watchdog fires unattended -- the selector loses the ability
-        # to cancel the advance because they never see it. Fields
-        # mirror the auto_advance_pending event so the frontend store
-        # (party.ts) can reuse the same hydration path.
-        pending_advance_payload = None
-        pending = party.get("pending_auto_advance")
-        if pending:
-            deadline = pending.get("deadline")
-            countdown_seconds = None
-            if deadline:
-                try:
-                    remaining = (
-                        datetime.fromisoformat(deadline) - datetime.now()
-                    ).total_seconds()
-                    countdown_seconds = max(0, int(remaining))
-                except Exception:
-                    countdown_seconds = None
-            pending_advance_payload = {
-                "next_item_id": pending.get("next_item_id"),
-                "next_title": pending.get("next_title"),
-                "next_index_number": pending.get("next_index_number"),
-                "total_episodes": max(
-                    (ep.get("IndexNumber") or 0)
-                    for ep in (party.get("episode_list") or [])
-                ) if party.get("episode_list") else 0,
-                "deadline": deadline,
-                "countdown_seconds": countdown_seconds,
-            }
-
-        await sio.emit("sync_state", {
-            "current_video": current_video,
-            "playback_state": playback_state,
-            # Binge-watching state is part of the joiner's view of the
-            # room: the control-strip button should render in the right
-            # state from the first frame instead of flickering when a
-            # follow-up event lands. available is read from the live
-            # admin toggle so flipping it off in /admin is reflected on
-            # the very next join.
-            "binge_watch": {
-                "available": bool(config.BINGE_WATCH_ENABLED),
-                "active": bool(party.get("binge_watch_active")),
-            },
-            "pending_auto_advance": pending_advance_payload,
-        }, to=sid)
-
-    @sio.on("join_vote")
-    async def handle_join_vote(sid, data):
-        """Vote submission from an eligible voter."""
-        party_id = data.get("party_id", "").strip().upper()
-        vote = data.get("vote")
-
-        if vote not in ("yes", "no"):
+        if action not in ("approve", "deny"):
             return
 
         party = party_manager.get(party_id)
         if not party:
             return
 
-        pj = party.get("pending_join")
-        if not pj:
-            logger.debug(f"Vote from {sid} ignored: no active vote in {party_id}")
+        if not _caller_is_host(party, sid):
+            logger.warning(
+                f"Join request decision REJECTED in {party_id}: sid={sid} "
+                f"is not the host (action={action}, request={request_id})"
+            )
+            await sio.emit("error", {
+                "message": "Only the host can approve or decline join requests."
+            }, to=sid)
             return
 
-        if sid not in pj["eligible_voters"]:
-            logger.debug(f"Vote from {sid} ignored: not an eligible voter in {party_id}")
+        request = (party.get("join_requests") or {}).get(request_id)
+        if not request:
+            # Double click / another tab already resolved it. Re-send the
+            # current queue so every client converges.
+            await _broadcast_join_requests(party, party_id)
             return
 
-        # Record the vote (overwriting any previous vote from the same user)
-        pj["votes"][sid] = vote
-        logger.debug(f"Vote recorded in {party_id}: {party['users'].get(sid, sid)} -> {vote}")
+        decided_by = party["users"].get(sid) or party.get("host_username") or "host"
 
-        # Broadcast the updated tally and check for early resolution
-        await _broadcast_vote_update(party, party_id)
-        await _check_vote_resolution(party_id)
+        if action == "approve":
+            if (
+                config.MAX_USERS_PER_PARTY > 0
+                and len(party["users"]) >= config.MAX_USERS_PER_PARTY
+            ):
+                logger.info(
+                    f"Join approval blocked in {party_id}: party is full "
+                    f"(max {config.MAX_USERS_PER_PARTY})"
+                )
+                await sio.emit("error", {
+                    "message": (
+                        f"Party is full (max {config.MAX_USERS_PER_PARTY} "
+                        f"users), so this request cannot be admitted."
+                    )
+                }, to=sid)
+                return
+            await _admit_join_request(party, party_id, request, decided_by=decided_by)
+        else:
+            await _deny_join_request(party, party_id, request, decided_by=decided_by)
 
     @sio.on("leave_party")
     async def handle_leave_party(sid, data):
@@ -780,8 +880,12 @@ def register(ctx):
         if not party:
             return
 
-        # If the leaving user is involved in an active vote, handle that first
-        await _handle_disconnect_from_vote(party, party_id, sid)
+        # If the leaving socket was waiting in the join-request queue,
+        # drop that request first so the host's list does not show a
+        # person who has already navigated away.
+        await _handle_join_request_sid_gone(party, party_id, sid)
+
+        host_departed = False
 
         # Host leaving explicitly (clicked Leave). A disconnect gets a 5s grace
         # window for refresh-as-rejoin, but an explicit leave is intentional, so
@@ -796,6 +900,7 @@ def register(ctx):
             and party.get("host_left_at") is None
         ):
             host_username = party.get("host_username") or "?"
+            host_departed = True
             pending = ctx.get("pending_host_clear", {})
             grace_task = pending.pop(party_id, None)
             if grace_task and not grace_task.done():
@@ -883,6 +988,12 @@ def register(ctx):
                 "users": list(party["users"].values()),
                 "members": party_manager.members_list(party_id),
             }, room=party_id)
+
+        if host_departed:
+            # Nobody is left to approve the queue. Admitting the pending
+            # joiners is better than leaving them stuck until the request
+            # timeout, and the party is now playing-only/locked anyway.
+            await _flush_pending_join_requests(party, party_id)
 
     @sio.on("update_avatar")
     async def handle_update_avatar(sid, data):

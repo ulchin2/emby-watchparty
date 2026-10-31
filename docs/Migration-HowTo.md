@@ -45,7 +45,7 @@ rollback. If the above worked, you're done.
   party
 - Multi-version playback (Emby's "Versions" picker — pick mp4 vs
   mkv vs Director's Cut at video-select time)
-- Late-joiner vote flow that prevents the keyframe-rounded
+- Host-approved late-join flow that prevents the keyframe-rounded
   scene-misalignment problem
 - Custom chat avatars with three-word recovery codes
 - A-Z library jump bar with right-click filter
@@ -356,7 +356,8 @@ of the moved settings to match your 1.x values:
 - All logging settings (Logging section)
 - Security toggles + rate-limit strings (Security section)
 - `STATIC_SESSION_*` (Session section)
-- `LATE_JOIN_VOTE_*` (Late Join Vote section, new in 2.0)
+- `LATE_JOIN_APPROVAL_ENABLED`, `LATE_JOIN_REQUEST_TIMEOUT_SECONDS`,
+  `LATE_JOIN_DENY_COOLDOWN_SECONDS` (Late Join Approval section)
 - `FORCE_TRANSCODE` (Playback section, new in 2.0)
 - `ENABLED_QUALITY_OPTIONS` (Quality section, new in 2.0)
 
@@ -554,8 +555,8 @@ deployment is in the state you'll want it long-term:
 - [ ] Logging configured (file vs console, level)
 - [ ] Rate limits + per-IP caps set if you want them (Security)
 - [ ] `MAX_USERS_PER_PARTY` set if you want a cap (Security)
-- [ ] `LATE_JOIN_VOTE_TIMEOUT_SECONDS` + cooldown tuned (Late
-      Join Vote)
+- [ ] `LATE_JOIN_REQUEST_TIMEOUT_SECONDS`, decline cooldown, and
+      `MAX_PENDING_JOIN_REQUESTS` tuned (Late Join Approval / Security)
 - [ ] `FORCE_TRANSCODE` decision made (Playback) — leave off for
       cheaper transcoding, turn on if Skip Intro / large seeks
       restart from 0

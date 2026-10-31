@@ -129,11 +129,17 @@ class PartyManager:
                 "last_update": datetime.now().isoformat(),
             },
             "ready_check": None,
-            "pending_join": None,
-            # Unix timestamp after which a new late-joiner vote can be
-            # triggered. Set after every failed/cancelled vote to prevent
-            # spam attacks. None or 0 means no cooldown active.
-            "join_cooldown_until": 0,
+            # Pending join requests, keyed by request id. Each value is
+            # {id, sid, username, client_id, avatar_uuid, requested_at,
+            # timeout_task}. The host (or the fallback path when the
+            # party has no host) resolves them one at a time; the list
+            # survives a host reload because it is party state, not a
+            # transient socket event.
+            "join_requests": {},
+            # Per-client denial cooldown (client_id -> unix timestamp).
+            # Only set on an explicit host decline, never on a
+            # dismissed notification or a cancelled request.
+            "join_denied_until": {},
             # Host = the Emby-authenticated member whose access_token signs
             # every Emby call for this party. host_left_at is set when the
             # host's socket drops; the grace window in connection.py

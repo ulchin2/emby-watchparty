@@ -18,11 +18,14 @@ const LibraryBrowser = defineAsyncComponent(
 const EmojiPicker = defineAsyncComponent(
   () => import('@/components/EmojiPicker.vue'),
 )
-const JoinVoteModal = defineAsyncComponent(
-  () => import('@/components/JoinVoteModal.vue'),
-)
 const JoinWaitingRoom = defineAsyncComponent(
   () => import('@/components/JoinWaitingRoom.vue'),
+)
+const JoinRequestToast = defineAsyncComponent(
+  () => import('@/components/JoinRequestToast.vue'),
+)
+const JoinRequestsPanel = defineAsyncComponent(
+  () => import('@/components/JoinRequestsPanel.vue'),
 )
 const EmbyLoginModal = defineAsyncComponent(
   () => import('@/components/EmbyLoginModal.vue'),
@@ -118,6 +121,10 @@ const showVersionModal = ref(false)
 const showParticipants = ref(false)
 const showMobileChat = ref(false)
 const showAdminModal = ref(false)
+// Host-only persistent queue of people asking to join mid-playback.
+// The header chip opens it; the toast links to it, but dismissing the
+// toast leaves this list intact.
+const showJoinRequests = ref(false)
 const adminTriggerBtn = ref<HTMLButtonElement | null>(null)
 const adminModalShellRef = ref<HTMLElement | null>(null)
 const videoPlayer = ref<InstanceType<typeof VideoPlayer> | null>(null)
@@ -158,10 +165,13 @@ watch(showAdminModal, (open, prev) => {
   }
 })
 
-// Auto-close the admin modal when a vote or ready check arrives, so
-// the admin doesn't miss party-blocking prompts stacked underneath.
-watch(() => party.pendingVote, (v) => {
-  if (v && showAdminModal.value) showAdminModal.value = false
+// Auto-close the admin modal when a join request or ready check
+// arrives, so the host doesn't miss party-blocking prompts stacked
+// underneath.
+watch(() => party.joinRequests.length, (count, previous) => {
+  if (count > (previous ?? 0) && showAdminModal.value) {
+    showAdminModal.value = false
+  }
 })
 watch(() => party.readyCheckActive, (active) => {
   if (active && showAdminModal.value) showAdminModal.value = false
@@ -186,19 +196,17 @@ onMounted(async () => {
   // stack duplicate listeners. Without this, repeated mounts caused a
   // single 'seek' broadcast to fire its addSystemMessage callback once
   // per stacked listener, flooding the chat with phantom seek messages.
-  // NOTE: do NOT include 'sync_state' or 'join_vote_resolved' here. The
-  // party store owns both. sync_state populates currentVideo; off()ing it
-  // would strip the store handler and late joiners never receive the video.
-  // join_vote_resolved is the listener that clears pendingVote (dismisses
-  // the vote modal) -- our handler below only adds the late-joiner redirect
-  // and explicitly relies on the store's handler running. off()ing it here
-  // removed the store's dismissal, so a passed vote left the modal open
-  // forever. The two listeners coexist safely on the same socket; the store
-  // re-offs these on every setupListeners() call, so they do not stack.
+  // NOTE: do NOT include 'sync_state' or any join-request event here. The
+  // party store owns them. sync_state populates currentVideo and hydrates
+  // the join-request queue; off()ing it would strip the store handler and
+  // late joiners never receive the video. The join_request_* listeners
+  // keep the host list and the waiting screen in sync -- PartyView only
+  // surfaces the rejection alert and redirect. The store re-offs its own
+  // events on every setupListeners() call, so they do not stack.
   const partyViewEvents = [
     'chat_message', 'play', 'pause', 'seek', 'force_pause_before_seek',
     'ready_check_update', 'drift_correction', 'all_ready',
-    'error', 'join_rejected', 'toggle_library',
+    'error', 'toggle_library',
   ]
   for (const e of partyViewEvents) socket.off(e)
 
@@ -597,17 +605,6 @@ onMounted(async () => {
   // same boolean here is a no-op.
   socket.on('toggle_library', (data: any) => {
     showLibrary.value = !!data.show
-  })
-
-  // Vote resolved as fail while we were the late joiner: the store
-  // already cleared the pending state; here we just redirect.
-  socket.on('join_vote_resolved', (data: any) => {
-    // The store's listener runs first and sets pendingVote=null. We
-    // only handle the redirect case here (late joiner got rejected).
-    if (data.result === 'fail' && !party.partyId) {
-      // If the store's leave() already ran, party.partyId is null.
-      router.push('/')
-    }
   })
 
   // Resolve any persisted avatar uuid BEFORE registering the watcher
@@ -1507,6 +1504,29 @@ async function submitBecomeHost(payload: { username: string; password: string })
         </span>
       </div>
       <div class="header-actions">
+        <!-- Host-only entry point to the persistent join-request list.
+             It stays visible after the toast is dismissed, so a missed
+             or mis-clicked notification never strands a waiting joiner. -->
+        <button
+          v-if="auth.isHost"
+          class="chip-btn join-requests-chip"
+          :class="{ 'has-requests': party.joinRequestCount > 0 }"
+          :title="party.joinRequestCount > 0
+            ? `${party.joinRequestCount} ${party.joinRequestCount === 1 ? 'person is' : 'people are'} waiting to join`
+            : 'No one is waiting to join'"
+          :aria-expanded="showJoinRequests"
+          @click="showJoinRequests = !showJoinRequests"
+        >
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2" />
+            <circle cx="9" cy="7" r="4" />
+            <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
+          </svg>
+          <span class="join-requests-label">Requests</span>
+          <span v-if="party.joinRequestCount > 0" class="join-requests-badge">
+            {{ party.joinRequestCount }}
+          </span>
+        </button>
         <div class="viewer-chip" :title="`${party.userCount} ${party.userCount === 1 ? 'person' : 'people'} watching`">
           <span class="viewer-dot" aria-hidden="true"></span>
           <span>{{ party.userCount }} watching</span>
@@ -1724,8 +1744,21 @@ async function submitBecomeHost(payload: { username: string; password: string })
     </div>
   </div>
 
-  <!-- Late-joiner vote modal (existing users) -->
-  <JoinVoteModal />
+  <!-- Non-blocking host notification for a new join request. It can be
+       dismissed without rejecting anyone; the persistent list below is
+       the actual control surface. -->
+  <JoinRequestToast
+    v-if="auth.isHost"
+    :panel-open="showJoinRequests"
+    @review="showJoinRequests = true"
+  />
+
+  <!-- Persistent host-side queue. Opened from the header chip or from
+       "Review all" on the toast. -->
+  <JoinRequestsPanel
+    v-if="auth.isHost && showJoinRequests"
+    @close="showJoinRequests = false"
+  />
 
   <!-- Late-joiner waiting room (the joiner themselves) -->
   <JoinWaitingRoom />
@@ -2157,6 +2190,33 @@ async function submitBecomeHost(payload: { username: string; password: string })
 .chip-btn-warn:hover {
   background: rgba(251, 191, 36, 0.22);
   border-color: rgba(251, 191, 36, 0.4);
+}
+
+/* Join-request chip: quiet until something is actually waiting, then
+   cyan-tinted with a count badge so a dismissed toast is still
+   discoverable. */
+.join-requests-chip.has-requests {
+  background: var(--accent-primary-dim);
+  border-color: rgba(34, 211, 238, 0.35);
+  color: var(--accent-primary);
+}
+
+.join-requests-badge {
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: var(--radius-full);
+  background: var(--accent-primary);
+  color: var(--bg-deep);
+  font-size: 0.68rem;
+  font-weight: 800;
+  line-height: 18px;
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .join-requests-label {
+    display: none;
+  }
 }
 
 /* Square icon button -- used for Admin gear. */

@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { usePartyStore } from '@/stores/party'
 
 const party = usePartyStore()
+const router = useRouter()
 
 const now = ref(Date.now())
+const cancelling = ref(false)
 let tick: ReturnType<typeof setInterval> | null = null
 
 onMounted(() => {
@@ -17,44 +20,69 @@ onUnmounted(() => {
   if (tick) clearInterval(tick)
 })
 
-const secondsRemaining = computed(() => {
-  if (!party.pendingVote) return 0
-  return Math.max(0, Math.ceil((party.pendingVote.timeoutAt - now.value) / 1000))
-})
-
-const timerLabel = computed(() => {
-  const s = secondsRemaining.value
-  const mm = Math.floor(s / 60).toString().padStart(2, '0')
-  const ss = (s % 60).toString().padStart(2, '0')
+function formatDuration(totalSeconds: number): string {
+  const safe = Math.max(0, totalSeconds)
+  const mm = Math.floor(safe / 60).toString().padStart(2, '0')
+  const ss = Math.floor(safe % 60).toString().padStart(2, '0')
   return `${mm}:${ss}`
+}
+
+// Expiry countdown. null means "this deployment does not expire
+// requests" (LATE_JOIN_REQUEST_TIMEOUT_SECONDS = 0), in which case the
+// waiting screen shows no deadline instead of a fake one.
+const timerLabel = computed(() => {
+  const request = party.pendingJoinRequest
+  if (!request || request.expiresAt === null) return null
+  return formatDuration(Math.ceil((request.expiresAt - now.value) / 1000))
 })
 
-// Show anonymized progress to the late joiner. We don't leak which
-// individual user voted which way -- only the aggregate count. This
-// keeps the experience less awkward if the vote fails.
-const progressText = computed(() => {
-  if (!party.pendingVote) return ''
-  const total = party.pendingVote.eligibleVoters.length
-  const voted = Object.keys(party.pendingVote.votes).length
-  return `${voted} of ${total} have voted`
+const waitingLabel = computed(() => {
+  const request = party.pendingJoinRequest
+  if (!request) return ''
+  return formatDuration(Math.floor((now.value - request.requestedAt) / 1000))
 })
+
+async function cancelRequest() {
+  if (cancelling.value) return
+  cancelling.value = true
+  try {
+    // leave_party also removes the queued request server-side.
+    await party.leave()
+  } finally {
+    router.push('/')
+  }
+}
 </script>
 
 <template>
-  <div v-if="party.pendingVote && party.pendingVote.isPending" class="waiting-room">
+  <div
+    v-if="party.pendingJoinRequest"
+    class="waiting-room"
+    role="status"
+    aria-live="polite"
+  >
     <div class="waiting-content">
-      <div class="spinner"></div>
-      <h2>Waiting for party approval</h2>
+      <div class="spinner" aria-hidden="true"></div>
+      <h2>Waiting for the host</h2>
       <p class="explain">
-        Your request to join is being reviewed. The party will decide
-        whether to restart the video so you can join in sync.
+        Your request is in the host's <strong>Join requests</strong> list.
+        The movie keeps playing for everyone else, and you'll be let in
+        automatically as soon as the host admits you.
       </p>
 
-      <div class="timer">
-        Vote ends in <strong>{{ timerLabel }}</strong>
+      <div v-if="timerLabel" class="timer">
+        Request expires in <strong>{{ timerLabel }}</strong>
       </div>
+      <div class="progress">Waiting for {{ waitingLabel }}</div>
 
-      <div class="progress">{{ progressText }}</div>
+      <p class="hint">
+        Closing a notification or panel does not decline your request.
+        It stays in the host's list until they decide.
+      </p>
+
+      <button class="cancel" :disabled="cancelling" @click="cancelRequest">
+        {{ cancelling ? 'Cancelling…' : 'Cancel request' }}
+      </button>
     </div>
   </div>
 </template>
@@ -72,7 +100,7 @@ const progressText = computed(() => {
 
 .waiting-content {
   text-align: center;
-  max-width: 440px;
+  max-width: 460px;
   padding: 40px;
   color: var(--text-primary);
 }
@@ -103,6 +131,10 @@ h2 {
   line-height: 1.5;
 }
 
+.explain strong {
+  color: var(--text-primary);
+}
+
 .timer {
   font-size: 1rem;
   color: var(--accent-primary);
@@ -117,5 +149,36 @@ h2 {
 .progress {
   font-size: 0.9rem;
   color: var(--text-muted);
+}
+
+.hint {
+  margin: 20px 0 0;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.cancel {
+  margin-top: 20px;
+  padding: 8px 18px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.cancel:hover:not(:disabled) {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-hover);
+  color: var(--text-primary);
+}
+
+.cancel:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 </style>

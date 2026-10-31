@@ -154,5 +154,31 @@ class UnexpectedFailureTests(_TargetFile):
         self.assertEqual(self.leftover_temp_files(), [])
 
 
+class LateJoinApprovalMigrationTests(_TargetFile):
+    """The 2.2 rename must not silently re-enable a disabled gate."""
+
+    def test_legacy_disabled_vote_flag_maps_to_approval(self):
+        self.path.write_text(
+            json.dumps({'LATE_JOIN_VOTE_ENABLED': False}), encoding='utf-8'
+        )
+
+        config = RuntimeConfig.from_file(self.path)
+
+        self.assertFalse(config.LATE_JOIN_APPROVAL_ENABLED)
+
+    def test_explicit_new_key_wins_over_the_legacy_key(self):
+        self.path.write_text(
+            json.dumps({
+                'LATE_JOIN_VOTE_ENABLED': False,
+                'LATE_JOIN_APPROVAL_ENABLED': True,
+            }),
+            encoding='utf-8',
+        )
+
+        config = RuntimeConfig.from_file(self.path)
+
+        self.assertTrue(config.LATE_JOIN_APPROVAL_ENABLED)
+
+
 if __name__ == '__main__':
     unittest.main()

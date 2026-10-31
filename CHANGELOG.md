@@ -16,6 +16,26 @@ Thanks to **[Christian Gillinger](https://github.com/cgillinger)** for the "Refi
 
 ---
 
+## [Unreleased]
+
+**Late joins are approved by the host from a persistent request list instead of a room-wide vote.**
+
+When someone joins while a video is already playing, their request now appears in the host's **Join requests** list. The host gets a non-blocking notification with **Admit** and **Later**; dismissing it, clicking outside it, or closing the list does **not** reject the person and does **not** start a cooldown. The request stays in the list until the host admits or declines it (or the configured timeout expires). Admitting a viewer starts their stream at the current playback position, so nobody is pulled back to the beginning.
+
+### Changed
+
+- **Replaced the late-joiner vote with a host approval queue.** Removed `join_vote`, `join_vote_started`, `join_vote_update`, and `join_vote_resolved`. New events: `join_request_decision` (client -> server), `join_requests_update`, `join_request_pending`, and `join_request_resolved`. `join_rejected` is still the joiner-facing rejection event.
+- **New runtime settings:** `LATE_JOIN_APPROVAL_ENABLED` (default `true`), `LATE_JOIN_REQUEST_TIMEOUT_SECONDS` (default `300`, `0` = never expires), `LATE_JOIN_DENY_COOLDOWN_SECONDS` (default `0`, applied only after an explicit decline), and `MAX_PENDING_JOIN_REQUESTS` (default `10`, `0` = unlimited).
+- **Removed the old settings:** `LATE_JOIN_VOTE_ENABLED`, `LATE_JOIN_VOTE_TIMEOUT_SECONDS`, and `LATE_JOIN_VOTE_COOLDOWN_SECONDS`. Existing `config.json` files keep loading; the obsolete keys are ignored on the next save.
+- **Cooldowns are per-client and opt-in.** The previous party-wide cooldown could lock every new viewer out after one rejection. Only an explicit host decline can set a cooldown now, and the default is disabled.
+
+### Fixed
+
+- **Host session grant was erased on every join.** `POST /api/party/<id>/join` unconditionally dropped `host_session_grant`, so after a page reload the fast host-reclaim path could not prove host identity and the party could collapse to PLAYING-ONLY/LOCKED despite the host returning. The grant is now preserved when the same `party_id` and `client_id` still prove host identity.
+- **Blank display names no longer desynchronise the client from the server.** The client generates `Guest-XXXX` locally when the name field is left empty, so its own chat messages, participant marker, and post-approval waiting-screen dismissal all match the name the server stored.
+
+---
+
 ## [2.1.6] - 2026-10-25 - Midnight Premiere
 
 **Frontend dependencies refreshed with upstream security fixes.**

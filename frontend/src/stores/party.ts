@@ -4,12 +4,26 @@ import { useSocketStore } from './socket'
 import { useAvatarStore } from './avatar'
 import { useAuthStore } from './auth'
 import { api } from '@/api/client'
-import { hideParty } from '@/utils/hiddenParties'
 import { detectVideoCodecs } from '@/utils/videoCodecs'
 
 export interface MemberInfo {
   username: string
   avatar_uuid?: string | null
+}
+
+/**
+ * One person waiting for the host to admit them while a video is
+ * already playing. The queue lives on the server (party state), so it
+ * survives a host page reload and dismissing the notification never
+ * rejects the request.
+ */
+export interface JoinRequestInfo {
+  id: string
+  username: string
+  avatar_uuid: string | null
+  /** Epoch ms, server clock-independent enough for a "waiting 0:42" label. */
+  requestedAt: number
+  timeoutSeconds: number
 }
 
 const CLIENT_ID_STORAGE_KEY = 'emby-watchparty-client-id'
@@ -125,19 +139,44 @@ export const usePartyStore = defineStore('party', () => {
     countdownSeconds: number | null
   } | null>(null)
 
-  // Late-joiner vote state. Non-null while a vote is in progress.
-  // isPending=true means "I am the late joiner being voted on" (waiting room).
-  // isPending=false means "I am an existing user voting on a late joiner" (modal).
-  const pendingVote = ref<{
-    active: boolean
-    isPending: boolean
-    lateJoinerUsername: string | null
-    eligibleVoters: string[]
-    votes: Record<string, 'yes' | 'no'>
-    myVote: 'yes' | 'no' | null
-    timeoutAt: number
-    requiredMajority: number
+  // Host-side queue of people asking to join mid-playback. The server
+  // broadcasts the whole queue on every change (and in sync_state), so
+  // a host who reloads still sees pending requests.
+  const joinRequests = ref<JoinRequestInfo[]>([])
+  const joinRequestCount = computed(() => joinRequests.value.length)
+
+  // Set only on the waiting joiner's own client. expiresAt is null when
+  // the admin configured requests to never expire.
+  const pendingJoinRequest = ref<{
+    id: string
+    username: string
+    requestedAt: number
+    expiresAt: number | null
   } | null>(null)
+
+  function normalizeJoinRequest(raw: any): JoinRequestInfo | null {
+    if (!raw || typeof raw.id !== 'string' || !raw.id) return null
+    return {
+      id: raw.id,
+      username: String(raw.username || 'Guest'),
+      avatar_uuid: typeof raw.avatar_uuid === 'string' ? raw.avatar_uuid : null,
+      requestedAt:
+        typeof raw.requested_at === 'number' ? raw.requested_at : Date.now(),
+      timeoutSeconds:
+        typeof raw.timeout_seconds === 'number' ? raw.timeout_seconds : 0,
+    }
+  }
+
+  function applyJoinRequests(list: any) {
+    const next: JoinRequestInfo[] = []
+    if (Array.isArray(list)) {
+      for (const raw of list) {
+        const normalised = normalizeJoinRequest(raw)
+        if (normalised) next.push(normalised)
+      }
+    }
+    joinRequests.value = next
+  }
 
   const userCount = computed(() => users.value.length)
 
@@ -147,6 +186,10 @@ export const usePartyStore = defineStore('party', () => {
     const normalisedId = id.toUpperCase()
     partyId.value = normalisedId
     username.value = name
+    // Never carry a previous party's request queue into this one; a
+    // rejoin/host reload rehydrates it from sync_state.
+    joinRequests.value = []
+    pendingJoinRequest.value = null
     const clientId = getClientId()
     // Load the persisted avatar id (IndexedDB or localStorage) so it
     // can ride along on the join. Safe to call repeatedly.
@@ -258,14 +301,18 @@ export const usePartyStore = defineStore('party', () => {
     readyCheckActive.value = false
     readyUsers.value = []
     waitingUsers.value = []
-    pendingVote.value = null
+    joinRequests.value = []
+    pendingJoinRequest.value = null
   }
 
-  function submitVote(vote: 'yes' | 'no') {
-    if (!partyId.value || !pendingVote.value) return
-    const socket = useSocketStore()
-    pendingVote.value.myVote = vote
-    socket.emit('join_vote', { party_id: partyId.value, vote })
+  /** Approve or decline a queued request. Host-only on the server. */
+  function decideJoinRequest(requestId: string, action: 'approve' | 'deny') {
+    if (!partyId.value || !requestId) return
+    useSocketStore().emit('join_request_decision', {
+      party_id: partyId.value,
+      request_id: requestId,
+      action,
+    })
   }
 
   function setupListeners() {
@@ -281,8 +328,8 @@ export const usePartyStore = defineStore('party', () => {
       'user_joined', 'user_left', 'sync_state', 'video_selected',
       'video_stopped', 'video_ended', 'play', 'pause', 'seek',
       'streams_changed', 'ready_check_update', 'all_ready',
-      'join_vote_started', 'join_vote_pending', 'join_vote_update',
-      'join_vote_resolved', 'join_rejected',
+      'join_requests_update', 'join_request_pending', 'join_request_resolved',
+      'join_rejected',
       'binge_watch_state_changed', 'auto_advance_pending',
       'auto_advance_cancelled', 'auto_advance_fired', 'binge_finished',
     ]
@@ -299,8 +346,8 @@ export const usePartyStore = defineStore('party', () => {
     // directions, exactly as reported. Because our client_id is stable
     // (localStorage) and lives in party["participants"], re-emitting
     // join_party takes the "known participant" fast path in party.py:
-    // _replace_sid migrates state to the new sid, no late-joiner vote
-    // fires, and the server sends a fresh sync_state.
+    // _replace_sid migrates state to the new sid, no join-approval
+    // request fires, and the server sends a fresh sync_state.
     //
     // We use a store-local flag (initialConnectSeen) instead of just
     // "is partyId set?" because join() runs asynchronously after
@@ -328,6 +375,15 @@ export const usePartyStore = defineStore('party', () => {
 
     socket.on('user_joined', (data: any) => {
       users.value = data.users
+      // If this is us landing after approval, the waiting screen must
+      // clear even if the resolution event raced behind user_joined.
+      const pending = pendingJoinRequest.value
+      if (
+        (data?.username && data.username === username.value)
+        || (pending && data?.username === pending.username)
+      ) {
+        pendingJoinRequest.value = null
+      }
       if (Array.isArray(data.members)) {
         const map: Record<string, string | null> = {}
         for (const m of data.members as MemberInfo[]) {
@@ -394,6 +450,14 @@ export const usePartyStore = defineStore('party', () => {
           timeoutAt: new Date(pa.deadline).getTime(),
           countdownSeconds: pa.countdown_seconds ?? null,
         }
+      }
+      // Hydrate the join-request queue. Only the host renders the
+      // list, but broadcasting it to the whole room keeps a newly
+      // promoted host's UI correct without an extra round-trip.
+      if (Array.isArray(data.join_requests)) {
+        applyJoinRequests(data.join_requests)
+      } else if (Array.isArray(data.join_requests?.requests)) {
+        applyJoinRequests(data.join_requests.requests)
       }
     })
 
@@ -544,69 +608,49 @@ export const usePartyStore = defineStore('party', () => {
     })
 
     // ---------------------------------------------------------------------
-    // Late-joiner vote listeners
+    // Join request listeners
     // ---------------------------------------------------------------------
 
-    // Existing user receives the vote modal
-    socket.on('join_vote_started', (data: any) => {
-      const timeoutSeconds = data.timeout_seconds || 20
-      pendingVote.value = {
-        active: true,
-        isPending: false,
-        lateJoinerUsername: data.username || null,
-        eligibleVoters: data.eligible_voters || [],
-        votes: {},
-        myVote: null,
-        timeoutAt: Date.now() + timeoutSeconds * 1000,
-        requiredMajority: data.required_majority || 1,
+    // Full queue snapshot. Sent on every change and also embedded in
+    // sync_state, so a host reload sees pending requests immediately.
+    socket.on('join_requests_update', (data: any) => {
+      applyJoinRequests(data?.requests)
+    })
+
+    // This client is now waiting for the host's decision.
+    socket.on('join_request_pending', (data: any) => {
+      if (!data || typeof data.id !== 'string' || !data.id) return
+      const timeoutSeconds = Number(data.timeout_seconds) || 0
+      pendingJoinRequest.value = {
+        id: data.id,
+        username: String(data.username || username.value || ''),
+        requestedAt:
+          typeof data.requested_at === 'number' ? data.requested_at : Date.now(),
+        // 0 means the admin disabled expiry; the waiting screen then
+        // shows no countdown instead of an infinite one.
+        expiresAt: timeoutSeconds > 0 ? Date.now() + timeoutSeconds * 1000 : null,
       }
     })
 
-    // Late joiner receives the waiting room
-    socket.on('join_vote_pending', (data: any) => {
-      const timeoutSeconds = data.timeout_seconds || 20
-      pendingVote.value = {
-        active: true,
-        isPending: true,
-        lateJoinerUsername: username.value,
-        eligibleVoters: data.eligible_voters || [],
-        votes: {},
-        myVote: null,
-        timeoutAt: Date.now() + timeoutSeconds * 1000,
-        requiredMajority: data.required_majority || 1,
+    // A request left the queue (approved, denied, expired, or the
+    // joiner's socket went away). Clears the waiting screen when it is
+    // our own request; the host list just drops the row.
+    socket.on('join_request_resolved', (data: any) => {
+      const id = typeof data?.request_id === 'string' ? data.request_id : ''
+      if (!id) return
+      joinRequests.value = joinRequests.value.filter((r) => r.id !== id)
+      // On approval, keep the waiting screen up until user_joined lands.
+      // Clearing it here would flash the join-name modal for one frame.
+      if (pendingJoinRequest.value?.id === id && data?.action !== 'approved') {
+        pendingJoinRequest.value = null
       }
     })
 
-    // Live vote updates -- everyone in the room receives these
-    socket.on('join_vote_update', (data: any) => {
-      if (!pendingVote.value) return
-      pendingVote.value.votes = data.votes || {}
-    })
-
-    // Vote resolved: pass, fail, or cancelled
-    socket.on('join_vote_resolved', (data: any) => {
-      const wasPending = pendingVote.value?.isPending === true
-      const result = data.result
-      pendingVote.value = null
-
-      if (result === 'fail' && wasPending) {
-        // The late joiner was rejected. Hide this party on the index so
-        // they are not repeatedly tempted to re-request it (captured
-        // before leave() clears partyId), then clear local party state.
-        hideParty(partyId.value)
-        leave()
-        // Router redirect is handled by the component watching `partyId`
-      } else if (result === 'cancelled') {
-        // The vote was cancelled (e.g. late joiner left). No action
-        // needed for existing users beyond dismissing the modal.
-      }
-    })
-
-    // Immediate rejection (e.g. another vote already in progress)
-    socket.on('join_rejected', (data: any) => {
-      pendingVote.value = null
-      // The caller (IndexView or PartyView) should observe this event
-      // and show a toast. We just clear the local state here.
+    // Rejection (host declined, request expired, queue/party full).
+    // PartyView owns the user-facing message + redirect; the store only
+    // clears the transient waiting state.
+    socket.on('join_rejected', () => {
+      pendingJoinRequest.value = null
       leave()
     })
   }
@@ -628,10 +672,10 @@ export const usePartyStore = defineStore('party', () => {
   return {
     partyId, username, users, members, currentVideo, playbackState, userCount,
     myStreamUrl, streamOffset, readyCheckActive, readyUsers, waitingUsers,
-    pendingVote,
+    joinRequests, joinRequestCount, pendingJoinRequest,
     bingeWatch, pendingAutoAdvance,
     sessionError, sessionRetrying, supersededBy,
-    join, leave, setupListeners, submitVote, retrySession,
+    join, leave, setupListeners, decideJoinRequest, retrySession,
     setBingeWatchActive, cancelAutoAdvance,
   }
 })

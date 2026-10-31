@@ -24,8 +24,8 @@ def register_all(sio, emby_client, party_manager, token_manager, stream_builder,
         'session_secret': session_secret,
     }
     register_connection(ctx)
-    # playback must register before party so the restart_video_from_beginning
-    # helper is available in ctx for the vote-pass flow in party.py
+    # playback must register before party so create_user_stream is in ctx
+    # when party.py builds the late-join stream for an approved request.
     register_playback(ctx)
     register_party(ctx)
     register_sync(ctx)

@@ -129,6 +129,12 @@ def register(ctx):
                 room=party_id,
             )
 
+        # The approver is gone; admit anyone still waiting rather than
+        # leaving them stuck in a queue with no one to clear it.
+        flush_pending = ctx.get("flush_pending_join_requests")
+        if flush_pending:
+            await flush_pending(party, party_id)
+
         pending_host_clear.pop(party_id, None)
 
     async def _try_host_reclaim(party_id: str, client_id: str, sid: str) -> bool:
@@ -233,7 +239,7 @@ def register(ctx):
     @sio.event
     async def disconnect(sid):
         logger.info(f"Client disconnected: {sid}")
-        handle_disconnect_from_vote = ctx.get('handle_disconnect_from_vote')
+        handle_join_request_sid_gone = ctx.get('handle_join_request_sid_gone')
 
         for party_id, party in list(party_manager.get_all().items()):
             # Host-leave detection runs before the rest of the cleanup
@@ -260,13 +266,12 @@ def register(ctx):
                     f"grace timer started ({HOST_GRACE_SECONDS}s)"
                 )
 
-            # Handle late-joiner vote cleanup (the disconnecting user may be
-            # the pending late joiner, or an eligible voter whose absence
-            # changes the majority math).
-            if party.get("pending_join") and handle_disconnect_from_vote:
-                pj = party["pending_join"]
-                if pj["sid"] == sid or sid in pj.get("eligible_voters", set()):
-                    await handle_disconnect_from_vote(party, party_id, sid)
+            # Drop a queued join request whose socket just went away. A
+            # reload re-requests within the next second, so this only
+            # clears genuinely abandoned entries; it never applies the
+            # decline cooldown.
+            if party.get("join_requests") and handle_join_request_sid_gone:
+                await handle_join_request_sid_gone(party, party_id, sid)
 
             if sid in party["users"]:
                 username = party["users"][sid]
